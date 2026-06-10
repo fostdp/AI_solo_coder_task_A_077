@@ -7,6 +7,8 @@ use axum::{
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
+use lazy_static::lazy_static;
+use prometheus::{IntCounter, IntGauge, Histogram, Registry, Encoder, TextEncoder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,6 +20,37 @@ use crate::collision_predictor::{CollisionAnalysis, Sgp4Propagator};
 use crate::config::AppConfig;
 use crate::models::*;
 use crate::orbit_optimizer_service::{OptimizerRequest, ManeuverPlan};
+
+lazy_static! {
+    pub static ref REGISTRY: Registry = Registry::new();
+    pub static ref TELEMETRY_RECEIVED: IntCounter = IntCounter::new(
+        "telemetry_received_total", "Total telemetry packets received"
+    ).unwrap();
+    pub static ref ACTIVE_SATELLITES: IntGauge = IntGauge::new(
+        "active_satellites", "Number of satellites with recent telemetry"
+    ).unwrap();
+    pub static ref ACTIVE_ALERTS: IntGauge = IntGauge::new(
+        "active_alerts", "Number of active collision alerts"
+    ).unwrap();
+    pub static ref COLLISION_ANALYSIS_SECONDS: Histogram = Histogram::with_opts(
+        HistogramOpts::new("collision_analysis_duration_seconds", "Time spent on collision analysis cycle")
+    ).unwrap();
+    pub static ref AVOIDANCE_COMPUTATIONS: IntCounter = IntCounter::new(
+        "avoidance_computations_total", "Total avoidance maneuver computations"
+    ).unwrap();
+    pub static ref HTTP_REQUESTS: IntCounter = IntCounter::new(
+        "http_requests_total", "Total HTTP requests served"
+    ).unwrap();
+}
+
+pub fn init_metrics() {
+    REGISTRY.register(Box::new(TELEMETRY_RECEIVED.clone())).unwrap();
+    REGISTRY.register(Box::new(ACTIVE_SATELLITES.clone())).unwrap();
+    REGISTRY.register(Box::new(ACTIVE_ALERTS.clone())).unwrap();
+    REGISTRY.register(Box::new(COLLISION_ANALYSIS_SECONDS.clone())).unwrap();
+    REGISTRY.register(Box::new(AVOIDANCE_COMPUTATIONS.clone())).unwrap();
+    REGISTRY.register(Box::new(HTTP_REQUESTS.clone())).unwrap();
+}
 
 pub struct AppState {
     pub clickhouse: ClickHouseClient,
@@ -56,11 +89,13 @@ pub fn create_router(state: SharedState) -> Router {
         .route("/api/collision-analysis", get(list_collision_analysis))
         .route("/api/collision-encounters", get(list_collision_encounters))
         .route("/api/compute-avoidance/:alert_id", post(compute_avoidance))
+        .route("/metrics", get(metrics_handler))
         .route("/ws", get(websocket_handler))
         .with_state(state)
 }
 
 async fn constellation_overview(State(state): State<SharedState>) -> impl IntoResponse {
+    HTTP_REQUESTS.inc();
     let s = state.read().await;
     let tel_map = s.latest_telemetry.read().await;
     let total = tel_map.len() as u32;
@@ -82,6 +117,9 @@ async fn constellation_overview(State(state): State<SharedState>) -> impl IntoRe
         .await
         .map(|a| a.len() as u32)
         .unwrap_or(0);
+
+    ACTIVE_SATELLITES.set(total as i64);
+    ACTIVE_ALERTS.set(active_alerts as i64);
 
     Json(ConstellationOverview {
         total_satellites: total,
@@ -442,9 +480,10 @@ async fn compute_avoidance(
         executed: maneuver.executed,
     };
 
+    AVOIDANCE_COMPUTATIONS.inc();
+
     Ok(Json(response))
 }
-
 async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_websocket(socket, state))
 }
@@ -499,4 +538,16 @@ async fn handle_websocket(socket: WebSocket, state: SharedState) {
         _ = send_task => {},
         _ = recv_task => {},
     }
+}
+
+async fn metrics_handler() -> impl IntoResponse {
+    let encoder = TextEncoder::new();
+    let metric_families = REGISTRY.gather();
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    let body = String::from_utf8(buffer).unwrap_or_default();
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
 }

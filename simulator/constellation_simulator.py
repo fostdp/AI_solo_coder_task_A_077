@@ -5,6 +5,8 @@ import random
 import time
 import threading
 import struct
+import argparse
+import os
 
 MU = 398600.4418
 RE = 6378.137
@@ -20,14 +22,23 @@ TA_SPACING = math.radians(22.5)
 
 TELEMETRY_INTERVAL = 30.0
 TLE_INTERVAL = 300.0
-UDP_HOST = "127.0.0.1"
-TELEMETRY_PORT = 9090
-TLE_PORT = 9091
+UDP_HOST = os.environ.get("UDP_HOST", "127.0.0.1")
+TELEMETRY_PORT = int(os.environ.get("TELEMETRY_PORT", "9090"))
+TLE_PORT = int(os.environ.get("TLE_PORT", "9091"))
 NUM_THREADS = 10
 SATS_PER_THREAD = NUM_SATS // NUM_THREADS
 
 DRAG_RATE = 0.01 / 86400.0
 PROPELLANT_RATE = 0.001
+
+PERTURBATION_ACTIVE = False
+PERTURBATION_TYPE = None
+COLLISION_INJECTED = False
+COLLISION_TYPE = None
+COLLISION_TIME = 300
+START_TIME = None
+DRAG_MULTIPLIER = 1.0
+LOCK = threading.Lock()
 
 
 def mean_motion_rad(a):
@@ -122,6 +133,30 @@ def generate_tle(sat):
     return line1, line2
 
 
+def build_tle_json(sat):
+    l1, l2 = generate_tle(sat)
+    now = time.time()
+    t = time.gmtime(now)
+    ey = t.tm_year % 100
+    ed = t.tm_yday + (t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec) / 86400.0
+    return json.dumps({
+        "satellite_id": sat["satellite_id"],
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "norad_id": str(sat["norad_id"]),
+        "line1": l1,
+        "line2": l2,
+        "epoch_year": float(ey),
+        "epoch_day": ed,
+        "mean_motion": mean_motion_revday(sat["semi_major_axis"]),
+        "eccentricity_tle": sat["eccentricity"],
+        "inclination_tle": sat["inclination"],
+        "raan_tle": sat["raan"],
+        "arg_perigee_tle": sat["arg_perigee"],
+        "mean_anomaly_tle": sat["mean_anomaly"],
+        "bstar": sat["bstar"],
+    })
+
+
 def init_satellite(sat_id):
     plane = (sat_id - 1) // SATS_PER_PLANE
     index = (sat_id - 1) % SATS_PER_PLANE
@@ -150,10 +185,74 @@ def init_satellite(sat_id):
     }
 
 
+def check_perturbation(satellites, elapsed):
+    global DRAG_MULTIPLIER, PERTURBATION_ACTIVE
+    with LOCK:
+        ptype = PERTURBATION_TYPE
+    if ptype is None:
+        return
+    if ptype == "solar_storm" and elapsed > 60 and not PERTURBATION_ACTIVE:
+        PERTURBATION_ACTIVE = True
+        DRAG_MULTIPLIER = 10.0
+        for sat in satellites:
+            sat["bstar"] *= 10.0
+        print("[PERTURBATION] Solar storm injected: drag x10, B* increased")
+    elif ptype == "drag_increase" and elapsed > 60:
+        ramp_duration = 300.0
+        if elapsed < 60 + ramp_duration:
+            progress = (elapsed - 60.0) / ramp_duration
+            DRAG_MULTIPLIER = 1.0 + 4.0 * progress
+            if not PERTURBATION_ACTIVE:
+                PERTURBATION_ACTIVE = True
+                print("[PERTURBATION] Gradual drag increase started: x{:.1f}".format(DRAG_MULTIPLIER))
+        elif DRAG_MULTIPLIER < 5.0:
+            DRAG_MULTIPLIER = 5.0
+            print("[PERTURBATION] Drag increase complete: x5.0")
+
+
+def check_collision_injection(satellites, elapsed):
+    global COLLISION_INJECTED
+    with LOCK:
+        ctype = COLLISION_TYPE
+        ctime = COLLISION_TIME
+    if ctype is None or COLLISION_INJECTED:
+        return
+    if elapsed < ctime:
+        return
+    COLLISION_INJECTED = True
+    if ctype == "head_on":
+        s1 = satellites[0]
+        s2 = satellites[1]
+        avg_raan = (s1["raan"] + s2["raan"]) / 2.0
+        avg_argp = (s1["arg_perigee"] + s2["arg_perigee"]) / 2.0
+        target_sma = (s1["semi_major_axis"] + s2["semi_major_axis"]) / 2.0
+        s1["raan"] = avg_raan
+        s1["arg_perigee"] = avg_argp
+        s1["semi_major_axis"] = target_sma
+        s1["true_anomaly"] = s1["true_anomaly"] % (2.0 * math.pi)
+        s2["raan"] = avg_raan + 0.00001
+        s2["arg_perigee"] = avg_argp + 0.00001
+        s2["semi_major_axis"] = target_sma + 0.001
+        s2["true_anomaly"] = (s1["true_anomaly"] + math.pi) % (2.0 * math.pi)
+        print("[COLLISION] Head-on encounter injected between SAT-001 and SAT-002")
+    elif ctype == "crossing":
+        s1 = satellites[0]
+        s2 = satellites[40]
+        crossing_raan = (s1["raan"] + s2["raan"]) / 2.0
+        s1["raan"] = crossing_raan - 0.0001
+        s2["raan"] = crossing_raan + 0.0001
+        s1["semi_major_axis"] = BASE_SMA + 0.5
+        s2["semi_major_axis"] = BASE_SMA - 0.5
+        nu_offset = (s1["true_anomaly"] + math.pi / 4.0) % (2.0 * math.pi)
+        s2["true_anomaly"] = nu_offset
+        print("[COLLISION] Crossing encounter injected between SAT-001 and SAT-041")
+
+
 def update_satellite(sat, dt):
+    global DRAG_MULTIPLIER
     n = mean_motion_rad(sat["semi_major_axis"])
     sat["true_anomaly"] = (sat["true_anomaly"] + n * dt) % (2.0 * math.pi)
-    sat["semi_major_axis"] -= DRAG_RATE * dt
+    sat["semi_major_axis"] -= DRAG_RATE * dt * DRAG_MULTIPLIER
     raan_drift = j2_raan_drift(sat["semi_major_axis"], sat["eccentricity"], sat["inclination"])
     sat["raan"] = (sat["raan"] + raan_drift * dt) % (2.0 * math.pi)
     sat["propellant"] -= PROPELLANT_RATE * (1.0 + random.uniform(-0.1, 0.1))
@@ -165,6 +264,8 @@ def update_satellite(sat, dt):
     sat["quat_z"] = math.sin(sat["quat_phase"])
     sat["mean_anomaly"] = true_to_mean_anomaly(sat["true_anomaly"], sat["eccentricity"])
     sat["seq"] = sat.get("seq", 0) + 1
+    if PERTURBATION_ACTIVE and PERTURBATION_TYPE == "solar_storm":
+        sat["semi_major_axis"] += random.uniform(-0.002, 0.002) * dt
 
 
 def build_telemetry(sat):
@@ -202,10 +303,15 @@ def build_telemetry(sat):
     )
 
 
-def worker(satellites, tel_sock, tle_sock, stop_event):
+def worker(satellites, all_satellites, tel_sock, tle_sock, stop_event):
+    global START_TIME
     last_tle_time = time.time()
     while not stop_event.is_set():
         cycle_start = time.time()
+        if START_TIME is not None:
+            elapsed = cycle_start - START_TIME
+            check_perturbation(all_satellites, elapsed)
+            check_collision_injection(all_satellites, elapsed)
         for sat in satellites:
             update_satellite(sat, TELEMETRY_INTERVAL)
             msg = build_telemetry(sat).encode("utf-8")
@@ -216,8 +322,7 @@ def worker(satellites, tel_sock, tle_sock, stop_event):
         now = time.time()
         if now - last_tle_time >= TLE_INTERVAL:
             for sat in satellites:
-                l1, l2 = generate_tle(sat)
-                tle_msg = "{}\n{}".format(l1, l2).encode("utf-8")
+                tle_msg = build_tle_json(sat).encode("utf-8")
                 try:
                     tle_sock.sendto(tle_msg, (UDP_HOST, TLE_PORT))
                 except OSError:
@@ -230,25 +335,58 @@ def worker(satellites, tel_sock, tle_sock, stop_event):
 
 
 def main():
+    global UDP_HOST, TELEMETRY_PORT, TLE_PORT, NUM_THREADS, SATS_PER_THREAD
+    global PERTURBATION_TYPE, COLLISION_TYPE, COLLISION_TIME, NUM_SATS, TELEMETRY_INTERVAL
+
+    parser = argparse.ArgumentParser(description="Satellite Constellation Simulator")
+    parser.add_argument("--num-sats", type=int, default=80)
+    parser.add_argument("--interval", type=float, default=30.0)
+    parser.add_argument("--host", type=str, default=None)
+    parser.add_argument("--telemetry-port", type=int, default=None)
+    parser.add_argument("--tle-port", type=int, default=None)
+    parser.add_argument("--threads", type=int, default=10)
+    parser.add_argument("--perturbation", type=str, default=None, choices=["solar_storm", "drag_increase"])
+    parser.add_argument("--collision", type=str, default=None, choices=["head_on", "crossing"])
+    parser.add_argument("--collision-time", type=int, default=300)
+    args = parser.parse_args()
+
+    NUM_SATS = args.num_sats
+    TELEMETRY_INTERVAL = args.interval
+    if args.host:
+        UDP_HOST = args.host
+    if args.telemetry_port:
+        TELEMETRY_PORT = args.telemetry_port
+    if args.tle_port:
+        TLE_PORT = args.tle_port
+    NUM_THREADS = args.threads
+    SATS_PER_THREAD = NUM_SATS // NUM_THREADS
+    PERTURBATION_TYPE = args.perturbation
+    COLLISION_TYPE = args.collision
+    COLLISION_TIME = args.collision_time
+
     satellites = [init_satellite(i + 1) for i in range(NUM_SATS)]
     tel_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     tle_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     stop_event = threading.Event()
+
+    global START_TIME
+    START_TIME = time.time()
+
     threads = []
     for t_idx in range(NUM_THREADS):
         start = t_idx * SATS_PER_THREAD
-        end = start + SATS_PER_THREAD
+        end = min(start + SATS_PER_THREAD, NUM_SATS)
         group = satellites[start:end]
         th = threading.Thread(
             target=worker,
-            args=(group, tel_sock, tle_sock, stop_event),
+            args=(group, satellites, tel_sock, tle_sock, stop_event),
             daemon=True,
         )
         threads.append(th)
         th.start()
     print(
-        "Constellation simulator started: {} satellites, {} threads".format(
-            NUM_SATS, NUM_THREADS
+        "Constellation simulator started: {} satellites, {} threads, interval={}s".format(
+            NUM_SATS, NUM_THREADS, TELEMETRY_INTERVAL
         )
     )
     print(
@@ -256,6 +394,10 @@ def main():
             UDP_HOST, TELEMETRY_PORT, UDP_HOST, TLE_PORT
         )
     )
+    if PERTURBATION_TYPE:
+        print("Perturbation scenario: {}".format(PERTURBATION_TYPE))
+    if COLLISION_TYPE:
+        print("Collision scenario: {} at t={}s".format(COLLISION_TYPE, COLLISION_TIME))
     try:
         while True:
             time.sleep(1)

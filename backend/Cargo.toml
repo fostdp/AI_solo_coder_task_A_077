@@ -15,7 +15,9 @@ clickhouse = { version = "0.13", features = ["chrono", "uuid"] }
 reqwest = { version = "0.12", features = ["json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "compression-gzip", "trace"] }
+prometheus = "0.13"
+lazy_static = "1"
 rand = "0.8"
 thiserror = "1"
 toml = "0.8"

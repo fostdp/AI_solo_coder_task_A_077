@@ -1,0 +1,69 @@
+version: "3.8"
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DB: satellite_constellation
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8080:8080"
+      - "9090:9090/udp"
+      - "9090:9090/tcp"
+      - "9091:9091/udp"
+      - "9091:9091/tcp"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CONFIG_PATH: /app/config.toml
+      RUST_LOG: info
+    volumes:
+      - ./backend/config.docker.toml:/app/config.toml:ro
+
+  simulator:
+    build: ./simulator
+    depends_on:
+      - backend
+    environment:
+      UDP_HOST: backend
+      TELEMETRY_PORT: "9090"
+      TLE_PORT: "9091"
+
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    ports:
+      - "9099:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command: --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.retention.time=15d
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  clickhouse_data:
+  grafana_data:

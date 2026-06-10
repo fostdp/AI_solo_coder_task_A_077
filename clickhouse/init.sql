@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS telemetry
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp)
-ORDER BY (satellite_id, timestamp);
+ORDER BY (satellite_id, timestamp)
+TTL timestamp + INTERVAL 90 DAY;
 
 -- 遥测表索引：按时间范围查询优化
 ALTER TABLE telemetry ADD INDEX idx_timestamp timestamp TYPE minmax GRANULARITY 4;
@@ -65,7 +66,8 @@ CREATE TABLE IF NOT EXISTS tle_data
     bstar               Float64   COMMENT 'B*阻力系数'
 )
 ENGINE = MergeTree()
-ORDER BY (satellite_id, timestamp);
+ORDER BY (satellite_id, timestamp)
+TTL timestamp + INTERVAL 30 DAY;
 
 -- TLE表索引：按NORAD编号快速检索
 ALTER TABLE tle_data ADD INDEX idx_norad_id norad_id TYPE tokenbf_v1(512, 3, 0) GRANULARITY 1;
@@ -88,7 +90,9 @@ CREATE TABLE IF NOT EXISTS collision_alerts
     maneuver_planned    UInt8     COMMENT '是否计划规避机动: 0=否, 1=是'
 )
 ENGINE = MergeTree()
-ORDER BY (timestamp, alert_level);
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (timestamp, alert_level)
+TTL timestamp + INTERVAL 180 DAY;
 
 -- 碰撞预警索引：按告警等级快速筛选紧急告警
 ALTER TABLE collision_alerts ADD INDEX idx_alert_level alert_level TYPE set(4) GRANULARITY 1;
@@ -118,7 +122,8 @@ CREATE TABLE IF NOT EXISTS orbit_maneuvers
     executed                UInt8     COMMENT '是否已执行: 0=未执行, 1=已执行'
 )
 ENGINE = MergeTree()
-ORDER BY (satellite_id, timestamp);
+ORDER BY (satellite_id, timestamp)
+TTL timestamp + INTERVAL 365 DAY;
 
 -- 轨道机动索引：按机动类型筛选
 ALTER TABLE orbit_maneuvers ADD INDEX idx_maneuver_type maneuver_type TYPE set(3) GRANULARITY 1;
@@ -138,7 +143,9 @@ CREATE TABLE IF NOT EXISTS propellant_history
     estimated_lifetime_hours Float64  COMMENT '预估剩余寿命 (小时)'
 )
 ENGINE = MergeTree()
-ORDER BY (satellite_id, timestamp);
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (satellite_id, timestamp)
+TTL timestamp + INTERVAL 180 DAY;
 
 -- 推进剂历史索引：按剩余量范围筛选（低燃料预警）
 ALTER TABLE propellant_history ADD INDEX idx_propellant_remaining propellant_remaining TYPE minmax GRANULARITY 4;

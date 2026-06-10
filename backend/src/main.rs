@@ -1,6 +1,6 @@
 use satellite_constellation_system::{
     alarm_commander::AlarmCommander,
-    api::{AppState, SharedState, create_router},
+    api::{AppState, SharedState, create_router, init_metrics, TELEMETRY_RECEIVED},
     clickhouse_client::ClickHouseClient,
     collision_predictor::{CollisionAnalysis, CollisionPredictor},
     config::AppConfig,
@@ -22,6 +22,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("Starting Satellite Constellation Orbit Control & Collision Warning System");
+
+    init_metrics();
 
     let config = AppConfig::load()?;
     tracing::info!("Configuration loaded from config.toml");
@@ -64,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let fanout_tel_cp = cp_telemetry_tx;
     let telemetry_task = tokio::spawn(async move {
         while let Some(data) = raw_telemetry_rx.recv().await {
+            TELEMETRY_RECEIVED.inc();
             {
                 let mut map = fanout_tel_state.write().await;
                 map.insert(data.satellite_id, data.clone());
@@ -146,6 +149,8 @@ async fn main() -> anyhow::Result<()> {
     }));
 
     let app = create_router(state.clone())
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::cors::CorsLayer::permissive())
         .fallback(static_files_fallback);
 
