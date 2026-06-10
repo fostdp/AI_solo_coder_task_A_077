@@ -497,4 +497,452 @@ impl CollisionProbabilityCalculator {
             encounter_point_eci: encounter,
         }
     }
+
+    pub fn analyze_pair_dual(
+        &self,
+        sgp4: &Sgp4Propagator,
+        numerical: &NumericalPropagator,
+        tle1: &TleData,
+        tle2: &TleData,
+        horizon_hours: f64,
+    ) -> CollisionAnalysis {
+        let end_min = horizon_hours * 60.0;
+
+        let sgp4_s1 = sgp4.propagate(tle1, end_min);
+        let sgp4_s2 = sgp4.propagate(tle2, end_min);
+        let num_s1 = numerical.propagate_from_tle(tle1, sgp4, end_min);
+        let num_s2 = numerical.propagate_from_tle(tle2, sgp4, end_min);
+
+        let div1 = ((sgp4_s1.position_x - num_s1.position_x).powi(2)
+            + (sgp4_s1.position_y - num_s1.position_y).powi(2)
+            + (sgp4_s1.position_z - num_s1.position_z).powi(2))
+        .sqrt();
+        let div2 = ((sgp4_s2.position_x - num_s2.position_x).powi(2)
+            + (sgp4_s2.position_y - num_s2.position_y).powi(2)
+            + (sgp4_s2.position_z - num_s2.position_z).powi(2))
+        .sqrt();
+
+        let use_numerical = div1 > 1.0 || div2 > 1.0;
+        if use_numerical {
+            tracing::info!(
+                "High SGP4/numerical divergence: sat{}={:.3}km, sat{}={:.3}km — using numerical propagator for TCA",
+                tle1.satellite_id, div1, tle2.satellite_id, div2
+            );
+        }
+
+        let tca = if use_numerical {
+            self.find_tca_with_propagator(tle1, tle2, 0.0, end_min, |tle, t_min| {
+                numerical.propagate_from_tle(tle, sgp4, t_min)
+            })
+        } else {
+            self.find_tca(sgp4, tle1, tle2, 0.0, end_min)
+        };
+
+        let collision_prob = self.compute_collision_probability(&tca);
+
+        let alert_level = if collision_prob > 1e-3 {
+            2
+        } else if collision_prob > 1e-4 {
+            1
+        } else {
+            0
+        };
+
+        let encounter = (
+            (tca.position1.0 + tca.position2.0) / 2.0,
+            (tca.position1.1 + tca.position2.1) / 2.0,
+            (tca.position1.2 + tca.position2.2) / 2.0,
+        );
+
+        CollisionAnalysis {
+            satellite_id_1: tle1.satellite_id,
+            satellite_id_2: tle2.satellite_id,
+            tca_result: tca,
+            collision_probability: collision_prob,
+            alert_level,
+            encounter_point_eci: encounter,
+        }
+    }
+
+    fn find_tca_with_propagator<F>(
+        &self,
+        tle1: &TleData,
+        tle2: &TleData,
+        search_start_min: f64,
+        search_end_min: f64,
+        propagate: F,
+    ) -> TcaResult
+    where
+        F: Fn(&TleData, f64) -> Sgp4State,
+    {
+        let span = search_end_min - search_start_min;
+        if span <= 0.0 {
+            let s1 = propagate(tle1, search_start_min);
+            let s2 = propagate(tle2, search_start_min);
+            return self.build_tca_result(&s1, &s2, search_start_min);
+        }
+
+        let coarse_steps = 200;
+        let coarse_step = span / coarse_steps as f64;
+        let mut best_t = search_start_min;
+        let mut best_dist = f64::MAX;
+
+        for k in 0..=coarse_steps {
+            let t = search_start_min + k as f64 * coarse_step;
+            let s1 = propagate(tle1, t);
+            let s2 = propagate(tle2, t);
+            let dist = self.compute_miss_distance(&s1, &s2);
+            if dist < best_dist {
+                best_dist = dist;
+                best_t = t;
+            }
+        }
+
+        let phi = (1.0 + 5_f64.sqrt()) / 2.0;
+        let resphi = 2.0 - phi;
+        let mut lo = (best_t - coarse_step).max(search_start_min);
+        let mut hi = (best_t + coarse_step).min(search_end_min);
+
+        let mut x1 = lo + resphi * (hi - lo);
+        let mut x2 = hi - resphi * (hi - lo);
+
+        let s1_a = propagate(tle1, x1);
+        let s2_a = propagate(tle2, x1);
+        let mut f1 = self.compute_miss_distance(&s1_a, &s2_a);
+
+        let s1_b = propagate(tle1, x2);
+        let s2_b = propagate(tle2, x2);
+        let mut f2 = self.compute_miss_distance(&s1_b, &s2_b);
+
+        for _ in 0..60 {
+            if f1 < f2 {
+                hi = x2;
+                x2 = x1;
+                f2 = f1;
+                x1 = lo + resphi * (hi - lo);
+                let s1 = propagate(tle1, x1);
+                let s2 = propagate(tle2, x1);
+                f1 = self.compute_miss_distance(&s1, &s2);
+            } else {
+                lo = x1;
+                x1 = x2;
+                f1 = f2;
+                x2 = hi - resphi * (hi - lo);
+                let s1 = propagate(tle1, x2);
+                let s2 = propagate(tle2, x2);
+                f2 = self.compute_miss_distance(&s1, &s2);
+            }
+            if (hi - lo).abs() < 1e-10 {
+                break;
+            }
+        }
+
+        let tca_t = (lo + hi) / 2.0;
+        let s1 = propagate(tle1, tca_t);
+        let s2 = propagate(tle2, tca_t);
+        self.build_tca_result(&s1, &s2, tca_t)
+    }
+}
+
+const J5: f64 = -2.7e-7;
+const J6: f64 = 3.4e-7;
+const OMEGA_EARTH: f64 = 7.2921159e-5;
+const SRP_PRESSURE: f64 = 4.56e-6;
+const REFLECTIVITY: f64 = 1.5;
+const SRP_AREA_MASS: f64 = 0.01;
+const DRAG_SCALE_HEIGHT: f64 = 58.515;
+const DRAG_RHO_0: f64 = 6.967e-13;
+const DRAG_H_REF: f64 = 500.0;
+const DRAG_CD: f64 = 2.2;
+const DRAG_AREA_MASS: f64 = 0.01;
+
+#[derive(Debug, Clone)]
+pub struct NumericalPropagatorConfig {
+    pub step_size_seconds: f64,
+    pub include_j2: bool,
+    pub include_j3: bool,
+    pub include_j4: bool,
+    pub include_j5_j6: bool,
+    pub include_drag: bool,
+    pub include_srp: bool,
+    pub solar_activity_f107: f64,
+}
+
+impl Default for NumericalPropagatorConfig {
+    fn default() -> Self {
+        Self {
+            step_size_seconds: 30.0,
+            include_j2: true,
+            include_j3: true,
+            include_j4: true,
+            include_j5_j6: true,
+            include_drag: true,
+            include_srp: true,
+            solar_activity_f107: 150.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DualPropagatorResult {
+    pub sgp4_state: Sgp4State,
+    pub numerical_state: Sgp4State,
+    pub position_divergence_km: f64,
+    pub velocity_divergence_km_s: f64,
+    pub corrected_state: Sgp4State,
+}
+
+pub struct NumericalPropagator {
+    config: NumericalPropagatorConfig,
+}
+
+impl NumericalPropagator {
+    pub fn new(config: NumericalPropagatorConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn propagate_from_state(&self, state: &Sgp4State, duration_seconds: f64) -> Sgp4State {
+        let mut s = [
+            state.position_x,
+            state.position_y,
+            state.position_z,
+            state.velocity_x,
+            state.velocity_y,
+            state.velocity_z,
+        ];
+
+        let dt = self.config.step_size_seconds;
+        let mut remaining = duration_seconds;
+
+        while remaining > 0.0 {
+            let step = dt.min(remaining);
+            s = self.rk4_step(&s, step);
+            remaining -= step;
+        }
+
+        Sgp4State {
+            position_x: s[0],
+            position_y: s[1],
+            position_z: s[2],
+            velocity_x: s[3],
+            velocity_y: s[4],
+            velocity_z: s[5],
+            time_minutes: state.time_minutes + duration_seconds / 60.0,
+        }
+    }
+
+    pub fn propagate_from_tle(
+        &self,
+        tle: &TleData,
+        sgp4: &Sgp4Propagator,
+        minutes_from_epoch: f64,
+    ) -> Sgp4State {
+        let initial = sgp4.propagate(tle, 0.0);
+        let duration_s = minutes_from_epoch * 60.0;
+        self.propagate_from_state(&initial, duration_s)
+    }
+
+    pub fn propagate_batch_from_tle(
+        &self,
+        tle: &TleData,
+        sgp4: &Sgp4Propagator,
+        start_min: f64,
+        end_min: f64,
+        step_min: f64,
+    ) -> Vec<Sgp4State> {
+        if step_min <= 0.0 {
+            return Vec::new();
+        }
+        let initial = sgp4.propagate(tle, 0.0);
+        let mut results = Vec::new();
+        let mut t = start_min;
+        while t <= end_min + step_min * 0.01 {
+            let state = self.propagate_from_state(&initial, t * 60.0);
+            results.push(state);
+            t += step_min;
+        }
+        results
+    }
+
+    pub fn compare_with_sgp4(
+        &self,
+        tle: &TleData,
+        sgp4: &Sgp4Propagator,
+        minutes_from_epoch: f64,
+    ) -> DualPropagatorResult {
+        let sgp4_state = sgp4.propagate(tle, minutes_from_epoch);
+        let numerical_state = self.propagate_from_tle(tle, sgp4, minutes_from_epoch);
+
+        let pos_div = ((sgp4_state.position_x - numerical_state.position_x).powi(2)
+            + (sgp4_state.position_y - numerical_state.position_y).powi(2)
+            + (sgp4_state.position_z - numerical_state.position_z).powi(2))
+        .sqrt();
+
+        let vel_div = ((sgp4_state.velocity_x - numerical_state.velocity_x).powi(2)
+            + (sgp4_state.velocity_y - numerical_state.velocity_y).powi(2)
+            + (sgp4_state.velocity_z - numerical_state.velocity_z).powi(2))
+        .sqrt();
+
+        let corrected_state = if pos_div > 1.0 {
+            numerical_state.clone()
+        } else {
+            Sgp4State {
+                position_x: (sgp4_state.position_x + numerical_state.position_x) / 2.0,
+                position_y: (sgp4_state.position_y + numerical_state.position_y) / 2.0,
+                position_z: (sgp4_state.position_z + numerical_state.position_z) / 2.0,
+                velocity_x: (sgp4_state.velocity_x + numerical_state.velocity_x) / 2.0,
+                velocity_y: (sgp4_state.velocity_y + numerical_state.velocity_y) / 2.0,
+                velocity_z: (sgp4_state.velocity_z + numerical_state.velocity_z) / 2.0,
+                time_minutes: minutes_from_epoch,
+            }
+        };
+
+        DualPropagatorResult {
+            sgp4_state,
+            numerical_state,
+            position_divergence_km: pos_div,
+            velocity_divergence_km_s: vel_div,
+            corrected_state,
+        }
+    }
+
+    fn rk4_step(&self, state: &[f64; 6], dt: f64) -> [f64; 6] {
+        let k1 = self.derivatives(state);
+
+        let mut s2 = [0.0; 6];
+        for i in 0..6 {
+            s2[i] = state[i] + 0.5 * dt * k1[i];
+        }
+        let k2 = self.derivatives(&s2);
+
+        let mut s3 = [0.0; 6];
+        for i in 0..6 {
+            s3[i] = state[i] + 0.5 * dt * k2[i];
+        }
+        let k3 = self.derivatives(&s3);
+
+        let mut s4 = [0.0; 6];
+        for i in 0..6 {
+            s4[i] = state[i] + dt * k3[i];
+        }
+        let k4 = self.derivatives(&s4);
+
+        let mut result = [0.0; 6];
+        for i in 0..6 {
+            result[i] = state[i] + dt / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
+        }
+        result
+    }
+
+    fn derivatives(&self, state: &[f64; 6]) -> [f64; 6] {
+        let pos = [state[0], state[1], state[2]];
+        let vel = [state[3], state[4], state[5]];
+
+        let acc = self.acceleration(&pos, &vel);
+
+        [vel[0], vel[1], vel[2], acc[0], acc[1], acc[2]]
+    }
+
+    fn acceleration(&self, pos: &[f64; 3], vel: &[f64; 3]) -> [f64; 3] {
+        let x = pos[0];
+        let y = pos[1];
+        let z = pos[2];
+        let r = (x * x + y * y + z * z).sqrt();
+        if r < 1.0 {
+            return [0.0; 3];
+        }
+
+        let r2 = r * r;
+        let r3 = r2 * r;
+        let r5 = r3 * r2;
+        let r7 = r5 * r2;
+
+        let mut ax = -MU_EARTH * x / r3;
+        let mut ay = -MU_EARTH * y / r3;
+        let mut az = -MU_EARTH * z / r3;
+
+        if self.config.include_j2 {
+            let z2 = z * z;
+            let fac = -1.5 * J2 * MU_EARTH * RE_EARTH * RE_EARTH / r5;
+            let z2r2 = 5.0 * z2 / r2;
+            ax += fac * x * (1.0 - z2r2);
+            ay += fac * y * (1.0 - z2r2);
+            az += fac * z * (3.0 - z2r2);
+        }
+
+        if self.config.include_j3 {
+            let z3 = z * z * z;
+            let fac = -2.5 * J3 * MU_EARTH * RE_EARTH.powi(3) / r7;
+            let z_r = z / r;
+            ax += fac * x * (3.0 * z_r - 7.0 * z3 / r3);
+            ay += fac * y * (3.0 * z_r - 7.0 * z3 / r3);
+            az += fac * (6.0 * z2 / r2 - 7.0 * z2 * z2 / r2 / r2 - 1.5);
+        }
+
+        if self.config.include_j4 {
+            let z2 = z * z;
+            let z4 = z2 * z2;
+            let fac = 1.875 * J4 * MU_EARTH * RE_EARTH.powi(4) / r7;
+            let z2r2 = z2 / r2;
+            let common = 1.0 - 14.0 * z2r2 + 21.0 * z2r2 * z2r2;
+            ax += fac * x * common;
+            ay += fac * y * common;
+            az += fac * z * (5.0 - 30.0 * z2r2 + 33.0 * z4 / r2 / r2);
+        }
+
+        if self.config.include_j5_j6 {
+            let z2 = z * z;
+            let z3 = z * z2;
+            let fac5 = 2.1875 * J5 * MU_EARTH * RE_EARTH.powi(5) / r7 / r2;
+            let z_r = z / r;
+            ax += fac5 * x * z_r * (5.0 - 21.0 * z2 / r2 + 33.0 * z2 * z2 / r2 / r2);
+            ay += fac5 * y * z_r * (5.0 - 21.0 * z2 / r2 + 33.0 * z2 * z2 / r2 / r2);
+            az += fac5 * (5.0 - 35.0 * z2 / r2 + 63.0 * z2 * z2 / r2 / r2) * z3 / z.max(1e-10);
+
+            let fac6 = 1.5625 * J6 * MU_EARTH * RE_EARTH.powi(6) / r7 / r2 / r2;
+            let z2r2 = z2 / r2;
+            let c6 = 1.0 - 27.0 * z2r2 + 99.0 * z2r2 * z2r2 - 429.0 / 35.0 * z2r2 * z2r2 * z2r2;
+            ax += fac6 * x * c6;
+            ay += fac6 * y * c6;
+            az += fac6 * z * (7.0 - 63.0 * z2r2 + 99.0 * z2r2 * z2r2 + z2 * z2 * z2 / r2 / r2 / r2 * (-429.0 / 5.0));
+        }
+
+        if self.config.include_drag {
+            let altitude = r - RE_EARTH;
+            if altitude > 0.0 && altitude < 2000.0 {
+                let f107_factor = (0.01 * (self.config.solar_activity_f107 - 150.0)).exp();
+                let rho = DRAG_RHO_0 * (-(altitude - DRAG_H_REF) / DRAG_SCALE_HEIGHT).exp() * f107_factor;
+                let v_rel_x = vel[0] + OMEGA_EARTH * pos[1];
+                let v_rel_y = vel[1] - OMEGA_EARTH * pos[0];
+                let v_rel_z = vel[2];
+                let v_rel = (v_rel_x * v_rel_x + v_rel_y * v_rel_y + v_rel_z * v_rel_z).sqrt();
+                if v_rel > 1e-10 {
+                    let drag_fac = -0.5 * rho * v_rel * DRAG_CD * DRAG_AREA_MASS;
+                    ax += drag_fac * v_rel_x;
+                    ay += drag_fac * v_rel_y;
+                    az += drag_fac * v_rel_z;
+                }
+            }
+        }
+
+        if self.config.include_srp {
+            let sun_x = 1.496e8;
+            let sun_r = (sun_x * sun_x).sqrt();
+            let srp_fac = SRP_PRESSURE * REFLECTIVITY * SRP_AREA_MASS / sun_r;
+            let shadow = {
+                let proj = (x * sun_x) / sun_r;
+                if proj < 0.0 {
+                    let perp2 = r2 - proj * proj;
+                    perp2 > RE_EARTH * RE_EARTH
+                } else {
+                    true
+                }
+            };
+            if shadow {
+                ax += srp_fac * sun_x / sun_r;
+            }
+        }
+
+        [ax, ay, az]
+    }
 }

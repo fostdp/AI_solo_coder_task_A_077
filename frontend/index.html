@@ -146,8 +146,8 @@ canvas{display:block}
 
   var scene, camera, renderer, controls, raycaster, mouse;
   var earthGroup, atmosphereMesh, satelliteGroup, orbitGroup, encounterGroup;
-  var satelliteMeshes = {};
-  var satelliteLabels = {};
+  var satBodyInstanced, leftPanelInstanced, rightPanelInstanced, dummyLeft, dummyRight;
+  var satelliteIndexMap = {};
   var satelliteDataMap = {};
   var encounterMarkers = [];
   var encounterLines = [];
@@ -314,103 +314,92 @@ canvas{display:block}
     scene.add(satelliteGroup);
     encounterGroup = new THREE.Group();
     scene.add(encounterGroup);
-  }
 
-  function createSatelliteMesh(id, riskLevel) {
-    var group = new THREE.Group();
-    var color = riskColor(riskLevel);
-
-    var bodyGeo = new THREE.BoxGeometry(0.015, 0.01, 0.01);
-    var bodyMat = new THREE.MeshPhongMaterial({ color: color, emissive: color, emissiveIntensity: 0.3 });
-    var body = new THREE.Mesh(bodyGeo, bodyMat);
-    group.add(body);
+    var MAX_SATELLITES = 80;
+    var satBodyGeo = new THREE.BoxGeometry(0.015, 0.01, 0.01);
+    var satBodyMat = new THREE.MeshPhongMaterial({ color: 0x00ff00, emissive: 0x00ff00, emissiveIntensity: 0.3 });
+    satBodyInstanced = new THREE.InstancedMesh(satBodyGeo, satBodyMat, MAX_SATELLITES);
+    satBodyInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    satBodyInstanced.count = 0;
+    satelliteGroup.add(satBodyInstanced);
 
     var panelGeo = new THREE.BoxGeometry(0.025, 0.001, 0.008);
     var panelMat = new THREE.MeshPhongMaterial({ color: 0x2244aa, emissive: 0x112244, emissiveIntensity: 0.2 });
-    var leftPanel = new THREE.Mesh(panelGeo, panelMat);
-    leftPanel.position.x = -0.02;
-    group.add(leftPanel);
-    var rightPanel = new THREE.Mesh(panelGeo, panelMat);
-    rightPanel.position.x = 0.02;
-    group.add(rightPanel);
+    leftPanelInstanced = new THREE.InstancedMesh(panelGeo, panelMat, MAX_SATELLITES);
+    leftPanelInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    leftPanelInstanced.count = 0;
+    rightPanelInstanced = new THREE.InstancedMesh(panelGeo, panelMat, MAX_SATELLITES);
+    rightPanelInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    rightPanelInstanced.count = 0;
+    satelliteGroup.add(leftPanelInstanced);
+    satelliteGroup.add(rightPanelInstanced);
 
-    group.userData = { satelliteId: id };
-    return group;
-  }
-
-  function updateSatelliteColor(mesh, riskLevel) {
-    var color = riskColor(riskLevel);
-    mesh.children[0].material.color.setHex(color);
-    mesh.children[0].material.emissive.setHex(color);
-  }
-
-  function createSatelliteLabel(id, mesh) {
-    var canvas = document.createElement('canvas');
-    canvas.width = 128;
-    canvas.height = 32;
-    var ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#a0b4d8';
-    ctx.font = '20px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('SAT-' + id, 64, 22);
-
-    var texture = new THREE.CanvasTexture(canvas);
-    var spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true, opacity: 0.8 });
-    var sprite = new THREE.Sprite(spriteMat);
-    sprite.scale.set(0.15, 0.04, 1);
-    sprite.position.y = 0.025;
-    mesh.add(sprite);
-    satelliteLabels[id] = sprite;
+    dummyLeft = new THREE.Object3D();
+    dummyRight = new THREE.Object3D();
   }
 
   function updateSatellites(satellites) {
-    var existingIds = new Set(Object.keys(satelliteMeshes).map(Number));
-    var newIds = new Set(satellites.map(function(s) { return s.satellite_id; }));
+    var count = Math.min(satellites.length, 80);
+    satBodyInstanced.count = count;
+    leftPanelInstanced.count = count;
+    rightPanelInstanced.count = count;
 
-    satellites.forEach(function(sat) {
-      var id = sat.satellite_id;
+    var dummy = new THREE.Object3D();
+    var color = new THREE.Color();
+
+    for (var i = 0; i < count; i++) {
+      var sat = satellites[i];
       var pos = sat.current_position;
-      var risk = sat.collision_risk_level;
-      satelliteDataMap[id] = sat;
+      satelliteDataMap[sat.satellite_id] = sat;
+      satelliteIndexMap[sat.satellite_id] = i;
 
-      if (satelliteMeshes[id]) {
-        var mesh = satelliteMeshes[id];
-        var sx = scaleKm(pos.x);
-        var sy = scaleKm(pos.y);
-        var sz = scaleKm(pos.z);
-        mesh.position.set(sx, sy, sz);
-        updateSatelliteColor(mesh, risk);
-      } else {
-        var mesh2 = createSatelliteMesh(id, risk);
-        var sx2 = scaleKm(pos.x);
-        var sy2 = scaleKm(pos.y);
-        var sz2 = scaleKm(pos.z);
-        mesh2.position.set(sx2, sy2, sz2);
-        createSatelliteLabel(id, mesh2);
-        satelliteGroup.add(mesh2);
-        satelliteMeshes[id] = mesh2;
-      }
-    });
+      dummy.position.set(scaleKm(pos.x), scaleKm(pos.y), scaleKm(pos.z));
+      dummy.updateMatrix();
+      satBodyInstanced.setMatrixAt(i, dummy.matrix);
 
-    existingIds.forEach(function(id) {
-      if (!newIds.has(id)) {
-        satelliteGroup.remove(satelliteMeshes[id]);
-        delete satelliteMeshes[id];
-        delete satelliteLabels[id];
-        delete satelliteDataMap[id];
-      }
-    });
+      color.setHex(riskColor(sat.collision_risk_level));
+      satBodyInstanced.setColorAt(i, color);
+
+      dummyLeft.position.set(scaleKm(pos.x) - 0.02, scaleKm(pos.y), scaleKm(pos.z));
+      dummyLeft.updateMatrix();
+      leftPanelInstanced.setMatrixAt(i, dummyLeft.matrix);
+
+      dummyRight.position.set(scaleKm(pos.x) + 0.02, scaleKm(pos.y), scaleKm(pos.z));
+      dummyRight.updateMatrix();
+      rightPanelInstanced.setMatrixAt(i, dummyRight.matrix);
+    }
+
+    satBodyInstanced.instanceMatrix.needsUpdate = true;
+    if (satBodyInstanced.instanceColor) satBodyInstanced.instanceColor.needsUpdate = true;
+    leftPanelInstanced.instanceMatrix.needsUpdate = true;
+    rightPanelInstanced.instanceMatrix.needsUpdate = true;
   }
 
   function updateSatellitePositionsFromWS(positions) {
     if (!positions || !Array.isArray(positions)) return;
+    var dummy = new THREE.Object3D();
+    var currentCount = satBodyInstanced.count;
+
     positions.forEach(function(p) {
-      var id = p.satellite_id;
-      var mesh = satelliteMeshes[id];
-      if (mesh && p.position) {
-        mesh.position.set(scaleKm(p.position.x), scaleKm(p.position.y), scaleKm(p.position.z));
+      var idx = satelliteIndexMap[p.satellite_id];
+      if (idx !== undefined && idx < currentCount && p.position) {
+        dummy.position.set(scaleKm(p.position.x), scaleKm(p.position.y), scaleKm(p.position.z));
+        dummy.updateMatrix();
+        satBodyInstanced.setMatrixAt(idx, dummy.matrix);
+
+        dummyLeft.position.set(scaleKm(p.position.x) - 0.02, scaleKm(p.position.y), scaleKm(p.position.z));
+        dummyLeft.updateMatrix();
+        leftPanelInstanced.setMatrixAt(idx, dummyLeft.matrix);
+
+        dummyRight.position.set(scaleKm(p.position.x) + 0.02, scaleKm(p.position.y), scaleKm(p.position.z));
+        dummyRight.updateMatrix();
+        rightPanelInstanced.setMatrixAt(idx, dummyRight.matrix);
       }
     });
+
+    satBodyInstanced.instanceMatrix.needsUpdate = true;
+    leftPanelInstanced.instanceMatrix.needsUpdate = true;
+    rightPanelInstanced.instanceMatrix.needsUpdate = true;
   }
 
   function loadOrbitPaths(satellites) {
@@ -418,17 +407,43 @@ canvas{display:block}
       orbitGroup.remove(orbitGroup.children[0]);
     }
 
+    var camPos = camera.position;
+    var camDistThreshold = 5.0;
+
     satellites.forEach(function(sat) {
       var id = sat.satellite_id;
       var risk = sat.collision_risk_level;
+      var pos = sat.current_position;
+      var satWorldPos = new THREE.Vector3(scaleKm(pos.x), scaleKm(pos.y), scaleKm(pos.z));
+      var distToCam = camPos.distanceTo(satWorldPos);
+
+      if (distToCam > camDistThreshold && risk === 'safe') return;
+
+      var segments;
+      if (risk === 'safe') {
+        segments = 24;
+      } else if (risk === 'warning') {
+        segments = 48;
+      } else {
+        segments = 96;
+      }
+
       fetch(API_BASE + '/api/satellites/' + id + '/orbit-path')
         .then(function(r) { return r.json(); })
         .then(function(path) {
           if (!Array.isArray(path) || path.length === 0) return;
-          var points = path.map(function(p) {
-            return new THREE.Vector3(scaleKm(p.x), scaleKm(p.y), scaleKm(p.z));
-          });
-          var geo = new THREE.BufferGeometry().setFromPoints(points);
+          var step = Math.max(1, Math.floor(path.length / segments));
+          var sampledPoints = [];
+          for (var i = 0; i < path.length; i += step) {
+            var p = path[i];
+            sampledPoints.push(new THREE.Vector3(scaleKm(p.x), scaleKm(p.y), scaleKm(p.z)));
+          }
+          var lastP = path[path.length - 1];
+          var lastVec = new THREE.Vector3(scaleKm(lastP.x), scaleKm(lastP.y), scaleKm(lastP.z));
+          if (sampledPoints.length > 0 && !sampledPoints[sampledPoints.length - 1].equals(lastVec)) {
+            sampledPoints.push(lastVec);
+          }
+          var geo = new THREE.BufferGeometry().setFromPoints(sampledPoints);
           var color = riskColor(risk);
           var mat = new THREE.LineBasicMaterial({
             color: color,
@@ -451,14 +466,32 @@ canvas{display:block}
 
     if (!encounters || !Array.isArray(encounters)) return;
 
+    var matrix = new THREE.Matrix4();
+
     encounters.forEach(function(enc) {
       if (enc.alert_level <= 0) return;
 
-      var mesh1 = satelliteMeshes[enc.satellite_id_1];
-      var mesh2 = satelliteMeshes[enc.satellite_id_2];
-      if (!mesh1 || !mesh2) return;
+      var idx1 = satelliteIndexMap[enc.satellite_id_1];
+      var idx2 = satelliteIndexMap[enc.satellite_id_2];
+      if (idx1 === undefined || idx2 === undefined) return;
 
-      var pts = [mesh1.position.clone(), mesh2.position.clone()];
+      var pos1 = new THREE.Vector3();
+      var pos2 = new THREE.Vector3();
+
+      if (idx1 < satBodyInstanced.count) {
+        satBodyInstanced.getMatrixAt(idx1, matrix);
+        pos1.setFromMatrixPosition(matrix);
+      } else {
+        return;
+      }
+      if (idx2 < satBodyInstanced.count) {
+        satBodyInstanced.getMatrixAt(idx2, matrix);
+        pos2.setFromMatrixPosition(matrix);
+      } else {
+        return;
+      }
+
+      var pts = [pos1.clone(), pos2.clone()];
       var geo = new THREE.BufferGeometry().setFromPoints(pts);
       var mat = new THREE.LineDashedMaterial({
         color: 0xff0000,
@@ -592,24 +625,14 @@ canvas{display:block}
     mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 
     raycaster.setFromCamera(mouse, camera);
-
-    var clickableMeshes = [];
-    Object.keys(satelliteMeshes).forEach(function(id) {
-      var group = satelliteMeshes[id];
-      group.children.forEach(function(child) {
-        if (child.isMesh) {
-          child.userData.satelliteId = group.userData.satelliteId;
-          clickableMeshes.push(child);
-        }
-      });
-    });
-
-    var intersects = raycaster.intersectObjects(clickableMeshes, false);
+    var intersects = raycaster.intersectObject(satBodyInstanced);
     if (intersects.length > 0) {
-      var hit = intersects[0].object;
-      var satId = hit.userData.satelliteId;
+      var instanceId = intersects[0].instanceId;
+      var satId = Object.keys(satelliteIndexMap).find(function(key) {
+        return satelliteIndexMap[key] === instanceId;
+      });
       if (satId !== undefined) {
-        openDetailPanel(satId);
+        openDetailPanel(parseInt(satId));
       }
     }
   }
@@ -894,14 +917,21 @@ canvas{display:block}
       marker.scale.setScalar(0.8 + 0.4 * Math.sin(elapsed * 3 + idx));
     });
 
-    Object.keys(satelliteMeshes).forEach(function(id) {
-      var mesh = satelliteMeshes[id];
-      var sat = satelliteDataMap[id];
-      if (sat && sat.collision_risk_level === 'danger') {
-        var blink = 0.7 + 0.3 * Math.sin(elapsed * 5);
-        mesh.children[0].material.emissiveIntensity = blink;
+    if (satBodyInstanced.count > 0) {
+      var blinkColor = new THREE.Color();
+      for (var id in satelliteDataMap) {
+        var sat = satelliteDataMap[id];
+        if (sat.collision_risk_level === 'danger') {
+          var idx = satelliteIndexMap[id];
+          if (idx !== undefined) {
+            blinkColor.setHex(0xff0000);
+            blinkColor.multiplyScalar(0.7 + 0.3 * Math.sin(elapsed * 5));
+            satBodyInstanced.setColorAt(idx, blinkColor);
+          }
+        }
       }
-    });
+      if (satBodyInstanced.instanceColor) satBodyInstanced.instanceColor.needsUpdate = true;
+    }
 
     renderer.render(scene, camera);
   }

@@ -2,6 +2,7 @@ use crate::models::{CollisionAlert, OrbitManeuver, TelemetryData, TleData};
 use crate::sgp4_engine::{CollisionAnalysis, CollisionProbabilityCalculator, Sgp4Propagator};
 use chrono::Utc;
 use rand::Rng;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 const SCALE_HEIGHT: f64 = 58.515;
@@ -74,19 +75,37 @@ struct Individual {
     fitness: f64,
 }
 
-pub struct GeneticOrbitOptimizer {
+struct Island {
+    population: Vec<Individual>,
+    best_fitness: f64,
+}
+
+pub struct CoEvolutionOrbitOptimizer {
     population_size: usize,
     generations: usize,
     mutation_rate: f64,
+    num_islands: usize,
+    migration_interval: usize,
+    migration_count: usize,
 }
 
-impl GeneticOrbitOptimizer {
+impl CoEvolutionOrbitOptimizer {
     pub fn new(population_size: usize, generations: usize, mutation_rate: f64) -> Self {
         Self {
             population_size,
             generations,
             mutation_rate,
+            num_islands: 4,
+            migration_interval: 5,
+            migration_count: 2,
         }
+    }
+
+    pub fn with_islands(mut self, num_islands: usize, migration_interval: usize, migration_count: usize) -> Self {
+        self.num_islands = num_islands.max(1);
+        self.migration_interval = migration_interval.max(1);
+        self.migration_count = migration_count.min(self.population_size / self.num_islands);
+        self
     }
 
     pub fn optimize_station_keeping(
@@ -95,32 +114,73 @@ impl GeneticOrbitOptimizer {
         target_sma: f64,
     ) -> ManeuverPlan {
         let mut rng = rand::thread_rng();
-        let mut population: Vec<Individual> = (0..self.population_size)
-            .map(|_| Self::random_individual_station_keeping(&mut rng))
+        let island_pop_size = (self.population_size / self.num_islands).max(1);
+
+        let mut islands: Vec<Island> = (0..self.num_islands)
+            .map(|_| {
+                let pop: Vec<Individual> = (0..island_pop_size)
+                    .map(|_| Self::random_individual_station_keeping(&mut rng))
+                    .collect();
+                let mut island = Island {
+                    population: pop,
+                    best_fitness: f64::NEG_INFINITY,
+                };
+                for ind in island.population.iter_mut() {
+                    ind.fitness = self.station_keeping_fitness(ind, telemetry, target_sma);
+                }
+                island.best_fitness = self.best_individual(&island.population).fitness;
+                island
+            })
             .collect();
 
-        for ind in population.iter_mut() {
-            ind.fitness = self.station_keeping_fitness(ind, telemetry, target_sma);
-        }
-
-        for _ in 0..self.generations {
-            let mut new_pop = Vec::with_capacity(self.population_size);
-
-            new_pop.push(self.best_individual(&population).clone());
-
-            while new_pop.len() < self.population_size {
-                let p1 = self.tournament_select(&population, &mut rng);
-                let p2 = self.tournament_select(&population, &mut rng);
-                let mut child = self.blx_alpha_crossover(&p1, &p2, 0.5, &mut rng);
-                self.mutate(&mut child, &mut rng);
-                child.fitness = self.station_keeping_fitness(&child, telemetry, target_sma);
-                new_pop.push(child);
+        for gen in 0..self.generations {
+            for island in islands.iter_mut() {
+                let mut new_pop = Vec::with_capacity(island_pop_size);
+                new_pop.push(self.best_individual(&island.population).clone());
+                while new_pop.len() < island_pop_size {
+                    let p1 = self.tournament_select(&island.population, &mut rng);
+                    let p2 = self.tournament_select(&island.population, &mut rng);
+                    let mut child = self.blx_alpha_crossover(&p1, &p2, 0.5, &mut rng);
+                    self.mutate(&mut child, &mut rng);
+                    child.fitness = self.station_keeping_fitness(&child, telemetry, target_sma);
+                    new_pop.push(child);
+                }
+                island.population = new_pop;
+                island.best_fitness = self.best_individual(&island.population).fitness;
             }
 
-            population = new_pop;
+            if (gen + 1) % self.migration_interval == 0 && islands.len() > 1 {
+                let migrants: Vec<Vec<Individual>> = islands
+                    .iter()
+                    .map(|island| {
+                        let mut sorted = island.population.clone();
+                        sorted.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+                        sorted[..self.migration_count.min(sorted.len())].to_vec()
+                    })
+                    .collect();
+                for i in 0..islands.len() {
+                    let target = (i + 1) % islands.len();
+                    let count = migrants[i].len().min(islands[target].population.len());
+                    if count > 0 {
+                        islands[target]
+                            .population
+                            .sort_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap());
+                        for j in 0..count {
+                            islands[target].population[j] = migrants[i][j].clone();
+                        }
+                        islands[target].best_fitness =
+                            self.best_individual(&islands[target].population).fitness;
+                    }
+                }
+            }
         }
 
-        let best = self.best_individual(&population);
+        let best = islands
+            .iter()
+            .flat_map(|island| island.population.iter())
+            .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap())
+            .unwrap();
+
         let dv_total = (best.dv_radial * best.dv_radial
             + best.dv_along * best.dv_along
             + best.dv_cross * best.dv_cross)
@@ -159,31 +219,81 @@ impl GeneticOrbitOptimizer {
         let calculator = CollisionProbabilityCalculator::new();
         let baseline = calculator.analyze_pair(propagator, tle1, tle2, 72.0);
 
-        let mut population: Vec<Individual> = (0..self.population_size)
-            .map(|_| Self::random_individual_avoidance(&mut rng))
+        let island_pop_size = (self.population_size / self.num_islands).max(1);
+
+        let mut islands: Vec<Island> = (0..self.num_islands)
+            .map(|_| {
+                let pop: Vec<Individual> = (0..island_pop_size)
+                    .map(|_| Self::random_individual_avoidance(&mut rng))
+                    .collect();
+                let mut island = Island {
+                    population: pop,
+                    best_fitness: f64::NEG_INFINITY,
+                };
+                for ind in island.population.iter_mut() {
+                    ind.fitness =
+                        self.avoidance_fitness(ind, telemetry, tle1, tle2, propagator, &calculator);
+                }
+                island.best_fitness = self.best_individual(&island.population).fitness;
+                island
+            })
             .collect();
 
-        for ind in population.iter_mut() {
-            ind.fitness = self.avoidance_fitness(ind, telemetry, tle1, tle2, propagator, &calculator);
-        }
-
-        for _ in 0..self.generations {
-            let mut new_pop = Vec::with_capacity(self.population_size);
-            new_pop.push(self.best_individual(&population).clone());
-
-            while new_pop.len() < self.population_size {
-                let p1 = self.tournament_select(&population, &mut rng);
-                let p2 = self.tournament_select(&population, &mut rng);
-                let mut child = self.blx_alpha_crossover(&p1, &p2, 0.5, &mut rng);
-                self.mutate_avoidance(&mut child, &mut rng);
-                child.fitness = self.avoidance_fitness(&child, telemetry, tle1, tle2, propagator, &calculator);
-                new_pop.push(child);
+        for gen in 0..self.generations {
+            for island in islands.iter_mut() {
+                let mut new_pop = Vec::with_capacity(island_pop_size);
+                new_pop.push(self.best_individual(&island.population).clone());
+                while new_pop.len() < island_pop_size {
+                    let p1 = self.tournament_select(&island.population, &mut rng);
+                    let p2 = self.tournament_select(&island.population, &mut rng);
+                    let mut child = self.blx_alpha_crossover(&p1, &p2, 0.5, &mut rng);
+                    self.mutate_avoidance(&mut child, &mut rng);
+                    child.fitness = self.avoidance_fitness(
+                        &child,
+                        telemetry,
+                        tle1,
+                        tle2,
+                        propagator,
+                        &calculator,
+                    );
+                    new_pop.push(child);
+                }
+                island.population = new_pop;
+                island.best_fitness = self.best_individual(&island.population).fitness;
             }
 
-            population = new_pop;
+            if (gen + 1) % self.migration_interval == 0 && islands.len() > 1 {
+                let migrants: Vec<Vec<Individual>> = islands
+                    .iter()
+                    .map(|island| {
+                        let mut sorted = island.population.clone();
+                        sorted.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+                        sorted[..self.migration_count.min(sorted.len())].to_vec()
+                    })
+                    .collect();
+                for i in 0..islands.len() {
+                    let target = (i + 1) % islands.len();
+                    let count = migrants[i].len().min(islands[target].population.len());
+                    if count > 0 {
+                        islands[target]
+                            .population
+                            .sort_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap());
+                        for j in 0..count {
+                            islands[target].population[j] = migrants[i][j].clone();
+                        }
+                        islands[target].best_fitness =
+                            self.best_individual(&islands[target].population).fitness;
+                    }
+                }
+            }
         }
 
-        let best = self.best_individual(&population);
+        let best = islands
+            .iter()
+            .flat_map(|island| island.population.iter())
+            .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap())
+            .unwrap();
+
         let dv_total = (best.dv_radial * best.dv_radial
             + best.dv_along * best.dv_along
             + best.dv_cross * best.dv_cross)
@@ -200,6 +310,159 @@ impl GeneticOrbitOptimizer {
             estimated_orbit_lifetime_days: 0.0,
             fitness_score: best.fitness,
         }
+    }
+
+    pub fn optimize_constellation_station_keeping(
+        &self,
+        telemetry_map: &HashMap<u16, TelemetryData>,
+        target_sma: f64,
+    ) -> Vec<ManeuverPlan> {
+        let mut planes: HashMap<u16, Vec<&TelemetryData>> = HashMap::new();
+        for telemetry in telemetry_map.values() {
+            let plane = telemetry.satellite_id / 16;
+            planes.entry(plane).or_default().push(telemetry);
+        }
+
+        let mut plans = Vec::new();
+
+        for mut sats in planes.into_values() {
+            sats.sort_by_key(|t| t.satellite_id);
+
+            let mut neighbor_results: Vec<(f64, Individual)> = Vec::new();
+            let mut plane_plans: Vec<ManeuverPlan> = Vec::new();
+
+            for telemetry in &sats {
+                let mut rng = rand::thread_rng();
+                let island_pop_size = (self.population_size / self.num_islands).max(1);
+
+                let mut islands: Vec<Island> = (0..self.num_islands)
+                    .map(|_| {
+                        let pop: Vec<Individual> = (0..island_pop_size)
+                            .map(|_| Self::random_individual_station_keeping(&mut rng))
+                            .collect();
+                        let mut island = Island {
+                            population: pop,
+                            best_fitness: f64::NEG_INFINITY,
+                        };
+                        for ind in island.population.iter_mut() {
+                            ind.fitness = self.constellation_fitness(
+                                ind,
+                                telemetry,
+                                target_sma,
+                                &neighbor_results,
+                            );
+                        }
+                        island.best_fitness = self.best_individual(&island.population).fitness;
+                        island
+                    })
+                    .collect();
+
+                for gen in 0..self.generations {
+                    for island in islands.iter_mut() {
+                        let mut new_pop = Vec::with_capacity(island_pop_size);
+                        new_pop.push(self.best_individual(&island.population).clone());
+                        while new_pop.len() < island_pop_size {
+                            let p1 = self.tournament_select(&island.population, &mut rng);
+                            let p2 = self.tournament_select(&island.population, &mut rng);
+                            let mut child = self.blx_alpha_crossover(&p1, &p2, 0.5, &mut rng);
+                            self.mutate(&mut child, &mut rng);
+                            child.fitness = self.constellation_fitness(
+                                &child,
+                                telemetry,
+                                target_sma,
+                                &neighbor_results,
+                            );
+                            new_pop.push(child);
+                        }
+                        island.population = new_pop;
+                        island.best_fitness = self.best_individual(&island.population).fitness;
+                    }
+
+                    if (gen + 1) % self.migration_interval == 0 && islands.len() > 1 {
+                        let migrants: Vec<Vec<Individual>> = islands
+                            .iter()
+                            .map(|island| {
+                                let mut sorted = island.population.clone();
+                                sorted.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+                                sorted[..self.migration_count.min(sorted.len())].to_vec()
+                            })
+                            .collect();
+                        for i in 0..islands.len() {
+                            let target = (i + 1) % islands.len();
+                            let count = migrants[i].len().min(islands[target].population.len());
+                            if count > 0 {
+                                islands[target]
+                                    .population
+                                    .sort_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap());
+                                for j in 0..count {
+                                    islands[target].population[j] = migrants[i][j].clone();
+                                }
+                                islands[target].best_fitness =
+                                    self.best_individual(&islands[target].population).fitness;
+                            }
+                        }
+                    }
+                }
+
+                let best = islands
+                    .iter()
+                    .flat_map(|island| island.population.iter())
+                    .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap())
+                    .unwrap();
+
+                neighbor_results.push((telemetry.semi_major_axis, best.clone()));
+
+                let dv_total = (best.dv_radial * best.dv_radial
+                    + best.dv_along * best.dv_along
+                    + best.dv_cross * best.dv_cross)
+                .sqrt();
+                let fuel = ManeuverPlan::compute_fuel_cost(dv_total);
+
+                let drag_model = AtmosphericDragModel::new();
+                let new_sma = telemetry.semi_major_axis + best.dv_along * 100.0;
+                let decay_rate = drag_model.orbit_decay_rate(new_sma, telemetry.eccentricity);
+                let lifetime = if decay_rate.abs() > 1e-10 {
+                    (telemetry.propellant_remaining - fuel).max(0.0)
+                        / (decay_rate.abs() * 0.1).max(1e-10)
+                } else {
+                    3650.0
+                };
+
+                plane_plans.push(ManeuverPlan {
+                    satellite_id: telemetry.satellite_id,
+                    delta_v_x: best.dv_radial,
+                    delta_v_y: best.dv_along,
+                    delta_v_z: best.dv_cross,
+                    fuel_cost: fuel,
+                    target_semi_major_axis: target_sma,
+                    estimated_orbit_lifetime_days: lifetime.min(3650.0),
+                    fitness_score: best.fitness,
+                });
+            }
+
+            plans.extend(plane_plans);
+        }
+
+        plans
+    }
+
+    fn constellation_fitness(
+        &self,
+        ind: &Individual,
+        telemetry: &TelemetryData,
+        target_sma: f64,
+        neighbor_results: &[(f64, Individual)],
+    ) -> f64 {
+        let mut fitness = self.station_keeping_fitness(ind, telemetry, target_sma);
+        let post_sma = telemetry.semi_major_axis + ind.dv_along * 100.0;
+        for (neighbor_sma, neighbor_ind) in neighbor_results {
+            let neighbor_post_sma = *neighbor_sma + neighbor_ind.dv_along * 100.0;
+            let distance = (post_sma - neighbor_post_sma).abs();
+            if distance < 10.0 {
+                fitness -= (10.0 - distance) * 1000.0;
+            }
+        }
+        fitness
     }
 
     fn station_keeping_fitness(&self, ind: &Individual, telemetry: &TelemetryData, target_sma: f64) -> f64 {
@@ -262,7 +525,7 @@ impl GeneticOrbitOptimizer {
         }
 
         let mut tle_mod = tle1.clone();
-        let dv_along_orbits = ind.dv_along / (tle_mod.mean_motion * 2.0 * std::f64::consts::PI / 1440.0).sqrt();
+        let _dv_along_orbits = ind.dv_along / (tle_mod.mean_motion * 2.0 * std::f64::consts::PI / 1440.0).sqrt();
         tle_mod.mean_motion += ind.dv_along * 0.001;
 
         let analysis = calculator.analyze_pair(propagator, &tle_mod, tle2, 72.0);
@@ -356,6 +619,8 @@ impl GeneticOrbitOptimizer {
         pop.iter().max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap()).unwrap()
     }
 }
+
+pub type GeneticOrbitOptimizer = CoEvolutionOrbitOptimizer;
 
 pub struct AlertManager;
 

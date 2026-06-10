@@ -146,6 +146,7 @@ def init_satellite(sat_id):
         "quat_phase": 0.0,
         "bstar": random.uniform(0.0001, 0.001),
         "mean_anomaly": true_to_mean_anomaly(nu, ecc),
+        "seq": 0,
     }
 
 
@@ -163,6 +164,7 @@ def update_satellite(sat, dt):
     sat["quat_y"] = 0.0
     sat["quat_z"] = math.sin(sat["quat_phase"])
     sat["mean_anomaly"] = true_to_mean_anomaly(sat["true_anomaly"], sat["eccentricity"])
+    sat["seq"] = sat.get("seq", 0) + 1
 
 
 def build_telemetry(sat):
@@ -176,6 +178,7 @@ def build_telemetry(sat):
     )
     return json.dumps(
         {
+            "sequence_number": sat.get("seq", 0),
             "satellite_id": sat["satellite_id"],
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "semi_major_axis": sat["semi_major_axis"],

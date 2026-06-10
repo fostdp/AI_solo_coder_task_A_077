@@ -6,6 +6,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct TelemetryData {
     pub satellite_id: u16,
+    pub sequence_number: u64,
     pub timestamp: DateTime<Utc>,
     pub semi_major_axis: f64,
     pub eccentricity: f64,

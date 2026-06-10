@@ -3,7 +3,7 @@ use satellite_constellation_system::{
     clickhouse_client::ClickHouseClient,
     models::*,
     orbit_optimizer::{AlertManager, AtmosphericDragModel, GeneticOrbitOptimizer},
-    sgp4_engine::{CollisionProbabilityCalculator, Sgp4Propagator},
+    sgp4_engine::{CollisionProbabilityCalculator, NumericalPropagator, NumericalPropagatorConfig, Sgp4Propagator},
     udp_receiver::start_udp_receiver,
 };
 use std::collections::HashMap;
@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
     let state: SharedState = Arc::new(RwLock::new(AppState {
         clickhouse,
         propagator: Sgp4Propagator::new(),
+        numerical_propagator: NumericalPropagator::new(NumericalPropagatorConfig::default()),
         calculator: CollisionProbabilityCalculator::new(),
         optimizer: GeneticOrbitOptimizer::new(50, 30, 0.15),
         alert_manager: AlertManager::new(),
@@ -87,7 +88,13 @@ async fn main() -> anyhow::Result<()> {
                     let id2 = tle_ids[j];
 
                     if let (Some(tle1), Some(tle2)) = (s.tle_cache.get(&id1), s.tle_cache.get(&id2)) {
-                        let analysis = s.calculator.analyze_pair(&s.propagator, tle1, tle2, 72.0);
+                        let analysis = s.calculator.analyze_pair_dual(
+                            &s.propagator,
+                            &s.numerical_propagator,
+                            tle1,
+                            tle2,
+                            72.0,
+                        );
 
                         if analysis.alert_level > 0 {
                             tracing::warn!(

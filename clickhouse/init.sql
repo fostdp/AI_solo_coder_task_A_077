@@ -14,6 +14,7 @@ USE satellite_constellation;
 CREATE TABLE IF NOT EXISTS telemetry
 (
     satellite_id        UInt16    COMMENT '卫星编号 1-80',
+    sequence_number     UInt64    COMMENT '数据包序列号',
     timestamp           DateTime  COMMENT '遥测时间戳',
     semi_major_axis     Float64   COMMENT '半长轴 a (km)',
     eccentricity        Float64   COMMENT '偏心率 e',
@@ -151,6 +152,7 @@ TO satellite_constellation.latest_telemetry
 AS
 SELECT
     satellite_id,
+    argMax(sequence_number, timestamp)     AS sequence_number,
     argMax(timestamp, timestamp)        AS timestamp,
     argMax(semi_major_axis, timestamp)  AS semi_major_axis,
     argMax(eccentricity, timestamp)     AS eccentricity,
@@ -172,6 +174,7 @@ GROUP BY satellite_id;
 CREATE TABLE IF NOT EXISTS latest_telemetry
 (
     satellite_id         UInt16,
+    sequence_number      UInt64,
     timestamp            DateTime,
     semi_major_axis      Float64,
     eccentricity         Float64,

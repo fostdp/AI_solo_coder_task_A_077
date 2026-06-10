@@ -17,11 +17,12 @@ use uuid::Uuid;
 use crate::clickhouse_client::ClickHouseClient;
 use crate::models::*;
 use crate::orbit_optimizer::{AlertManager, AtmosphericDragModel, GeneticOrbitOptimizer};
-use crate::sgp4_engine::{CollisionAnalysis, CollisionProbabilityCalculator, Sgp4Propagator};
+use crate::sgp4_engine::{CollisionAnalysis, CollisionProbabilityCalculator, NumericalPropagator, NumericalPropagatorConfig, Sgp4Propagator};
 
 pub struct AppState {
     pub clickhouse: ClickHouseClient,
     pub propagator: Sgp4Propagator,
+    pub numerical_propagator: NumericalPropagator,
     pub calculator: CollisionProbabilityCalculator,
     pub optimizer: GeneticOrbitOptimizer,
     pub alert_manager: AlertManager,
