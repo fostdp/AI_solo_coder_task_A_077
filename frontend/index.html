@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>卫星星座轨道控制与碰撞预警系统</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a2e;color:#e0e0f0;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;overflow:hidden;width:100vw;height:100vh}
+#canvas-container{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0}
+canvas{display:block}
+#top-bar{position:fixed;top:0;left:0;right:320px;height:56px;background:rgba(10,10,46,0.92);backdrop-filter:blur(12px);border-bottom:1px solid rgba(100,140,255,0.15);z-index:10;display:flex;align-items:center;padding:0 24px;gap:32px}
+#top-bar .logo{font-size:16px;font-weight:700;color:#7eb8ff;letter-spacing:1px;white-space:nowrap}
+#top-bar .stat{display:flex;align-items:center;gap:8px;font-size:13px;color:#a0b4d8}
+#top-bar .stat .label{color:#6888b8;font-size:11px;text-transform:uppercase;letter-spacing:0.5px}
+#top-bar .stat .value{font-size:15px;font-weight:600;color:#e0ecff}
+#top-bar .stat .value.alert-val{color:#ff6b6b}
+#top-bar .stat .value.propellant-val{color:#4ecdc4}
+.stat-divider{width:1px;height:28px;background:rgba(100,140,255,0.15)}
+#alert-panel{position:fixed;top:0;right:0;width:320px;height:100%;background:rgba(10,10,46,0.94);backdrop-filter:blur(12px);border-left:1px solid rgba(100,140,255,0.15);z-index:10;display:flex;flex-direction:column;transition:transform 0.3s ease}
+#alert-panel.collapsed{transform:translateX(280px)}
+#alert-panel-toggle{position:absolute;left:-36px;top:12px;width:36px;height:36px;background:rgba(10,10,46,0.9);border:1px solid rgba(100,140,255,0.2);border-right:none;border-radius:6px 0 0 6px;color:#7eb8ff;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background 0.2s}
+#alert-panel-toggle:hover{background:rgba(30,30,80,0.95)}
+#alert-panel .panel-header{padding:14px 18px;border-bottom:1px solid rgba(100,140,255,0.12);font-size:14px;font-weight:600;color:#7eb8ff;display:flex;align-items:center;justify-content:space-between}
+#alert-panel .panel-header .badge{background:#ff4444;color:#fff;font-size:11px;padding:2px 8px;border-radius:10px;font-weight:700}
+#alert-list{flex:1;overflow-y:auto;padding:8px}
+#alert-list::-webkit-scrollbar{width:4px}
+#alert-list::-webkit-scrollbar-track{background:transparent}
+#alert-list::-webkit-scrollbar-thumb{background:rgba(100,140,255,0.2);border-radius:2px}
+.alert-card{background:rgba(20,20,60,0.6);border:1px solid rgba(100,140,255,0.1);border-radius:8px;padding:12px;margin-bottom:8px;transition:border-color 0.2s}
+.alert-card:hover{border-color:rgba(100,140,255,0.3)}
+.alert-card.level-1{border-left:3px solid #ffd700}
+.alert-card.level-2{border-left:3px solid #ff4444}
+.alert-card .alert-pair{font-size:13px;font-weight:600;color:#e0ecff;margin-bottom:6px}
+.alert-card .alert-detail{font-size:11px;color:#8899bb;line-height:1.7}
+.alert-card .alert-detail span{color:#b0c4e8}
+.alert-card .alert-badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;margin-left:4px}
+.alert-badge.level-1{background:rgba(255,215,0,0.2);color:#ffd700}
+.alert-badge.level-2{background:rgba(255,68,68,0.2);color:#ff4444}
+.alert-card .btn-avoidance{margin-top:8px;padding:5px 12px;background:rgba(255,68,68,0.15);border:1px solid rgba(255,68,68,0.4);color:#ff6b6b;border-radius:4px;font-size:11px;cursor:pointer;transition:all 0.2s;width:100%;text-align:center}
+.alert-card .btn-avoidance:hover{background:rgba(255,68,68,0.3);border-color:rgba(255,68,68,0.7)}
+.alert-card .btn-avoidance:disabled{opacity:0.4;cursor:not-allowed}
+#detail-panel{position:fixed;top:56px;left:0;width:380px;max-height:calc(100% - 56px);background:rgba(10,10,46,0.95);backdrop-filter:blur(12px);border-right:1px solid rgba(100,140,255,0.15);z-index:15;overflow-y:auto;transform:translateX(-100%);transition:transform 0.3s ease;padding:0}
+#detail-panel.open{transform:translateX(0)}
+#detail-panel::-webkit-scrollbar{width:4px}
+#detail-panel::-webkit-scrollbar-track{background:transparent}
+#detail-panel::-webkit-scrollbar-thumb{background:rgba(100,140,255,0.2);border-radius:2px}
+.detail-header{position:sticky;top:0;background:rgba(10,10,46,0.98);padding:16px 18px;border-bottom:1px solid rgba(100,140,255,0.12);display:flex;align-items:center;justify-content:space-between;z-index:1}
+.detail-header h3{font-size:15px;color:#7eb8ff;font-weight:600}
+.detail-close{width:28px;height:28px;border-radius:50%;border:1px solid rgba(100,140,255,0.2);background:transparent;color:#8899bb;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s}
+.detail-close:hover{background:rgba(255,68,68,0.15);color:#ff6b6b;border-color:rgba(255,68,68,0.4)}
+.detail-section{padding:14px 18px;border-bottom:1px solid rgba(100,140,255,0.08)}
+.detail-section h4{font-size:12px;color:#6888b8;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:10px}
+.detail-table{width:100%;border-collapse:collapse}
+.detail-table td{padding:3px 0;font-size:12px}
+.detail-table td:first-child{color:#6888b8;width:40%}
+.detail-table td:last-child{color:#e0ecff;font-weight:500}
+.propellant-bar-bg{width:100%;height:6px;background:rgba(100,140,255,0.1);border-radius:3px;overflow:hidden;margin-top:4px}
+.propellant-bar-fill{height:100%;border-radius:3px;transition:width 0.5s ease}
+#propellant-chart{width:100%;height:100px;border-radius:6px;background:rgba(5,5,30,0.6)}
+.telemetry-table{width:100%;border-collapse:collapse;font-size:10px}
+.telemetry-table th{text-align:left;padding:4px 6px;color:#6888b8;border-bottom:1px solid rgba(100,140,255,0.1);font-weight:500}
+.telemetry-table td{padding:3px 6px;color:#b0c4e8;border-bottom:1px solid rgba(100,140,255,0.04)}
+.telemetry-table tr:hover{background:rgba(100,140,255,0.04)}
+.risk-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
+.risk-badge.safe{background:rgba(0,255,0,0.12);color:#4ecdc4}
+.risk-badge.warning{background:rgba(255,255,0,0.12);color:#ffd700}
+.risk-badge.danger{background:rgba(255,0,0,0.12);color:#ff4444}
+#loading-overlay{position:fixed;inset:0;background:rgba(10,10,46,0.95);z-index:100;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:opacity 0.5s}
+#loading-overlay.hidden{opacity:0;pointer-events:none}
+.spinner{width:40px;height:40px;border:3px solid rgba(100,140,255,0.15);border-top-color:#7eb8ff;border-radius:50%;animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#loading-overlay p{margin-top:16px;color:#6888b8;font-size:13px}
+#toast-container{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:50;display:flex;flex-direction:column;gap:8px;align-items:center}
+.toast{padding:10px 20px;border-radius:6px;font-size:13px;color:#fff;opacity:0;transform:translateY(10px);transition:all 0.3s;pointer-events:none}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.success{background:rgba(0,200,120,0.9)}
+.toast.error{background:rgba(255,68,68,0.9)}
+.toast.info{background:rgba(80,130,255,0.9)}
+.ws-status{position:fixed;bottom:12px;left:12px;z-index:10;font-size:10px;padding:4px 10px;border-radius:12px;background:rgba(10,10,46,0.8);border:1px solid rgba(100,140,255,0.15)}
+.ws-status.connected{color:#4ecdc4;border-color:rgba(78,205,196,0.3)}
+.ws-status.disconnected{color:#ff6b6b;border-color:rgba(255,107,107,0.3)}
+</style>
+</head>
+<body>
+<div id="canvas-container"></div>
+
+<div id="loading-overlay">
+  <div class="spinner"></div>
+  <p>正在加载卫星星座数据...</p>
+</div>
+
+<div id="top-bar">
+  <div class="logo">&#x1F6F0; 星座轨道控制系统</div>
+  <div class="stat-divider"></div>
+  <div class="stat">
+    <span class="label">卫星总数</span>
+    <span class="value" id="stat-total">--</span>
+  </div>
+  <div class="stat-divider"></div>
+  <div class="stat">
+    <span class="label">活跃警报</span>
+    <span class="value alert-val" id="stat-alerts">--</span>
+  </div>
+  <div class="stat-divider"></div>
+  <div class="stat">
+    <span class="label">平均推进剂</span>
+    <span class="value propellant-val" id="stat-propellant">--</span>
+  </div>
+  <div class="stat-divider"></div>
+  <div class="stat">
+    <span class="label">覆盖状态</span>
+    <span class="value" id="stat-coverage">--</span>
+  </div>
+</div>
+
+<div id="alert-panel">
+  <button id="alert-panel-toggle">&#x25B6;</button>
+  <div class="panel-header">
+    <span>碰撞预警</span>
+    <span class="badge" id="alert-count-badge">0</span>
+  </div>
+  <div id="alert-list"></div>
+</div>
+
+<div id="detail-panel">
+  <div class="detail-header">
+    <h3 id="detail-title">卫星详情</h3>
+    <button class="detail-close" id="detail-close">&times;</button>
+  </div>
+  <div id="detail-content"></div>
+</div>
+
+<div class="ws-status disconnected" id="ws-status">WS: 未连接</div>
+<div id="toast-container"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function() {
+  'use strict';
+
+  var API_BASE = 'http://localhost:8080';
+  var WS_URL = 'ws://localhost:8080/ws';
+  var RE_EARTH = 6378.137;
+
+  var scene, camera, renderer, controls, raycaster, mouse;
+  var earthGroup, atmosphereMesh, satelliteGroup, orbitGroup, encounterGroup;
+  var satelliteMeshes = {};
+  var satelliteLabels = {};
+  var satelliteDataMap = {};
+  var encounterMarkers = [];
+  var encounterLines = [];
+  var clock = new THREE.Clock();
+  var selectedSatelliteId = null;
+  var ws = null;
+  var wsReconnectTimer = null;
+
+  function scaleKm(km) { return km / RE_EARTH; }
+
+  function showToast(msg, type) {
+    var c = document.getElementById('toast-container');
+    var t = document.createElement('div');
+    t.className = 'toast ' + (type || 'info');
+    t.textContent = msg;
+    c.appendChild(t);
+    requestAnimationFrame(function() { t.classList.add('show'); });
+    setTimeout(function() {
+      t.classList.remove('show');
+      setTimeout(function() { c.removeChild(t); }, 300);
+    }, 3000);
+  }
+
+  function riskColor(level) {
+    if (level === 'danger') return 0xff0000;
+    if (level === 'warning') return 0xffff00;
+    return 0x00ff00;
+  }
+
+  function riskColorCSS(level) {
+    if (level === 'danger') return '#ff4444';
+    if (level === 'warning') return '#ffd700';
+    return '#4ecdc4';
+  }
+
+  function initScene() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 100);
+    camera.position.set(0, 2, 3);
+    camera.lookAt(0, 0, 0);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(0x0a0a2e, 1);
+    document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.minDistance = 1.5;
+    controls.maxDistance = 10;
+    controls.target.set(0, 0, 0);
+
+    raycaster = new THREE.Raycaster();
+    mouse = new THREE.Vector2();
+
+    var ambientLight = new THREE.AmbientLight(0x334466, 0.6);
+    scene.add(ambientLight);
+
+    var dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(5, 3, 5);
+    scene.add(dirLight);
+
+    var dirLight2 = new THREE.DirectionalLight(0x4466aa, 0.3);
+    dirLight2.position.set(-3, -1, -3);
+    scene.add(dirLight2);
+
+    createStars();
+    createEarth();
+    createGroups();
+
+    window.addEventListener('resize', onWindowResize);
+    renderer.domElement.addEventListener('click', onCanvasClick);
+  }
+
+  function createStars() {
+    var geo = new THREE.BufferGeometry();
+    var count = 3000;
+    var positions = new Float32Array(count * 3);
+    for (var i = 0; i < count * 3; i++) {
+      positions[i] = (Math.random() - 0.5) * 60;
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    var mat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.03, sizeAttenuation: true });
+    scene.add(new THREE.Points(geo, mat));
+  }
+
+  function createEarth() {
+    earthGroup = new THREE.Group();
+    scene.add(earthGroup);
+
+    var earthGeo = new THREE.SphereGeometry(1, 64, 48);
+    var earthMat = new THREE.MeshPhongMaterial({
+      color: 0x1a4a8a,
+      emissive: 0x0a1a3a,
+      specular: 0x333366,
+      shininess: 15
+    });
+    var earthMesh = new THREE.Mesh(earthGeo, earthMat);
+    earthGroup.add(earthMesh);
+
+    var atmosGeo = new THREE.SphereGeometry(1.02, 64, 48);
+    var atmosMat = new THREE.MeshPhongMaterial({
+      color: 0x4488ff,
+      transparent: true,
+      opacity: 0.08,
+      side: THREE.BackSide
+    });
+    atmosphereMesh = new THREE.Mesh(atmosGeo, atmosMat);
+    earthGroup.add(atmosphereMesh);
+
+    var glowGeo = new THREE.SphereGeometry(1.06, 32, 24);
+    var glowMat = new THREE.MeshBasicMaterial({
+      color: 0x3366ff,
+      transparent: true,
+      opacity: 0.04,
+      side: THREE.BackSide
+    });
+    earthGroup.add(new THREE.Mesh(glowGeo, glowMat));
+
+    createGridLines();
+  }
+
+  function createGridLines() {
+    var gridMat = new THREE.LineBasicMaterial({ color: 0x3366aa, transparent: true, opacity: 0.15 });
+    var r = 1.001;
+
+    for (var lat = -80; lat <= 80; lat += 20) {
+      var phi = (90 - lat) * Math.PI / 180;
+      var pts = [];
+      for (var lon = 0; lon <= 360; lon += 3) {
+        var theta = lon * Math.PI / 180;
+        pts.push(new THREE.Vector3(
+          r * Math.sin(phi) * Math.cos(theta),
+          r * Math.cos(phi),
+          r * Math.sin(phi) * Math.sin(theta)
+        ));
+      }
+      var geo = new THREE.BufferGeometry().setFromPoints(pts);
+      earthGroup.add(new THREE.Line(geo, gridMat));
+    }
+
+    for (var lon2 = 0; lon2 < 360; lon2 += 30) {
+      var theta2 = lon2 * Math.PI / 180;
+      var pts2 = [];
+      for (var lat2 = -90; lat2 <= 90; lat2 += 3) {
+        var phi2 = (90 - lat2) * Math.PI / 180;
+        pts2.push(new THREE.Vector3(
+          r * Math.sin(phi2) * Math.cos(theta2),
+          r * Math.cos(phi2),
+          r * Math.sin(phi2) * Math.sin(theta2)
+        ));
+      }
+      var geo2 = new THREE.BufferGeometry().setFromPoints(pts2);
+      earthGroup.add(new THREE.Line(geo2, gridMat));
+    }
+  }
+
+  function createGroups() {
+    orbitGroup = new THREE.Group();
+    scene.add(orbitGroup);
+    satelliteGroup = new THREE.Group();
+    scene.add(satelliteGroup);
+    encounterGroup = new THREE.Group();
+    scene.add(encounterGroup);
+  }
+
+  function createSatelliteMesh(id, riskLevel) {
+    var group = new THREE.Group();
+    var color = riskColor(riskLevel);
+
+    var bodyGeo = new THREE.BoxGeometry(0.015, 0.01, 0.01);
+    var bodyMat = new THREE.MeshPhongMaterial({ color: color, emissive: color, emissiveIntensity: 0.3 });
+    var body = new THREE.Mesh(bodyGeo, bodyMat);
+    group.add(body);
+
+    var panelGeo = new THREE.BoxGeometry(0.025, 0.001, 0.008);
+    var panelMat = new THREE.MeshPhongMaterial({ color: 0x2244aa, emissive: 0x112244, emissiveIntensity: 0.2 });
+    var leftPanel = new THREE.Mesh(panelGeo, panelMat);
+    leftPanel.position.x = -0.02;
+    group.add(leftPanel);
+    var rightPanel = new THREE.Mesh(panelGeo, panelMat);
+    rightPanel.position.x = 0.02;
+    group.add(rightPanel);
+
+    group.userData = { satelliteId: id };
+    return group;
+  }
+
+  function updateSatelliteColor(mesh, riskLevel) {
+    var color = riskColor(riskLevel);
+    mesh.children[0].material.color.setHex(color);
+    mesh.children[0].material.emissive.setHex(color);
+  }
+
+  function createSatelliteLabel(id, mesh) {
+    var canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 32;
+    var ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#a0b4d8';
+    ctx.font = '20px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('SAT-' + id, 64, 22);
+
+    var texture = new THREE.CanvasTexture(canvas);
+    var spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true, opacity: 0.8 });
+    var sprite = new THREE.Sprite(spriteMat);
+    sprite.scale.set(0.15, 0.04, 1);
+    sprite.position.y = 0.025;
+    mesh.add(sprite);
+    satelliteLabels[id] = sprite;
+  }
+
+  function updateSatellites(satellites) {
+    var existingIds = new Set(Object.keys(satelliteMeshes).map(Number));
+    var newIds = new Set(satellites.map(function(s) { return s.satellite_id; }));
+
+    satellites.forEach(function(sat) {
+      var id = sat.satellite_id;
+      var pos = sat.current_position;
+      var risk = sat.collision_risk_level;
+      satelliteDataMap[id] = sat;
+
+      if (satelliteMeshes[id]) {
+        var mesh = satelliteMeshes[id];
+        var sx = scaleKm(pos.x);
+        var sy = scaleKm(pos.y);
+        var sz = scaleKm(pos.z);
+        mesh.position.set(sx, sy, sz);
+        updateSatelliteColor(mesh, risk);
+      } else {
+        var mesh2 = createSatelliteMesh(id, risk);
+        var sx2 = scaleKm(pos.x);
+        var sy2 = scaleKm(pos.y);
+        var sz2 = scaleKm(pos.z);
+        mesh2.position.set(sx2, sy2, sz2);
+        createSatelliteLabel(id, mesh2);
+        satelliteGroup.add(mesh2);
+        satelliteMeshes[id] = mesh2;
+      }
+    });
+
+    existingIds.forEach(function(id) {
+      if (!newIds.has(id)) {
+        satelliteGroup.remove(satelliteMeshes[id]);
+        delete satelliteMeshes[id];
+        delete satelliteLabels[id];
+        delete satelliteDataMap[id];
+      }
+    });
+  }
+
+  function updateSatellitePositionsFromWS(positions) {
+    if (!positions || !Array.isArray(positions)) return;
+    positions.forEach(function(p) {
+      var id = p.satellite_id;
+      var mesh = satelliteMeshes[id];
+      if (mesh && p.position) {
+        mesh.position.set(scaleKm(p.position.x), scaleKm(p.position.y), scaleKm(p.position.z));
+      }
+    });
+  }
+
+  function loadOrbitPaths(satellites) {
+    while (orbitGroup.children.length > 0) {
+      orbitGroup.remove(orbitGroup.children[0]);
+    }
+
+    satellites.forEach(function(sat) {
+      var id = sat.satellite_id;
+      var risk = sat.collision_risk_level;
+      fetch(API_BASE + '/api/satellites/' + id + '/orbit-path')
+        .then(function(r) { return r.json(); })
+        .then(function(path) {
+          if (!Array.isArray(path) || path.length === 0) return;
+          var points = path.map(function(p) {
+            return new THREE.Vector3(scaleKm(p.x), scaleKm(p.y), scaleKm(p.z));
+          });
+          var geo = new THREE.BufferGeometry().setFromPoints(points);
+          var color = riskColor(risk);
+          var mat = new THREE.LineBasicMaterial({
+            color: color,
+            transparent: true,
+            opacity: 0.2
+          });
+          var line = new THREE.Line(geo, mat);
+          orbitGroup.add(line);
+        })
+        .catch(function() {});
+    });
+  }
+
+  function loadEncounterPoints(encounters) {
+    while (encounterGroup.children.length > 0) {
+      encounterGroup.remove(encounterGroup.children[0]);
+    }
+    encounterMarkers = [];
+    encounterLines = [];
+
+    if (!encounters || !Array.isArray(encounters)) return;
+
+    encounters.forEach(function(enc) {
+      if (enc.alert_level <= 0) return;
+
+      var mesh1 = satelliteMeshes[enc.satellite_id_1];
+      var mesh2 = satelliteMeshes[enc.satellite_id_2];
+      if (!mesh1 || !mesh2) return;
+
+      var pts = [mesh1.position.clone(), mesh2.position.clone()];
+      var geo = new THREE.BufferGeometry().setFromPoints(pts);
+      var mat = new THREE.LineDashedMaterial({
+        color: 0xff0000,
+        dashSize: 0.02,
+        gapSize: 0.01,
+        transparent: true,
+        opacity: 0.7
+      });
+      var line = new THREE.Line(geo, mat);
+      line.computeLineDistances();
+      encounterGroup.add(line);
+      encounterLines.push(line);
+
+      if (enc.encounter_point_eci) {
+        var ep = enc.encounter_point_eci;
+        var markerGeo = new THREE.SphereGeometry(0.012, 12, 8);
+        var markerMat = new THREE.MeshBasicMaterial({
+          color: 0xff0000,
+          transparent: true,
+          opacity: 0.8
+        });
+        var marker = new THREE.Mesh(markerGeo, markerMat);
+        marker.position.set(scaleKm(ep[0]), scaleKm(ep[1]), scaleKm(ep[2]));
+        encounterGroup.add(marker);
+        encounterMarkers.push(marker);
+      }
+    });
+  }
+
+  function loadAlerts() {
+    fetch(API_BASE + '/api/alerts')
+      .then(function(r) { return r.json(); })
+      .then(function(alerts) {
+        renderAlertPanel(alerts);
+      })
+      .catch(function(err) {
+        console.error('Failed to load alerts:', err);
+      });
+  }
+
+  function renderAlertPanel(alerts) {
+    var list = document.getElementById('alert-list');
+    list.innerHTML = '';
+    var activeAlerts = alerts.filter(function(a) { return a.alert_level > 0; });
+    document.getElementById('alert-count-badge').textContent = activeAlerts.length;
+    document.getElementById('stat-alerts').textContent = activeAlerts.length;
+
+    if (activeAlerts.length === 0) {
+      list.innerHTML = '<div style="padding:20px;text-align:center;color:#6888b8;font-size:12px">暂无活跃碰撞预警</div>';
+      return;
+    }
+
+    activeAlerts.sort(function(a, b) { return b.alert_level - a.alert_level; });
+
+    activeAlerts.forEach(function(alert) {
+      var card = document.createElement('div');
+      card.className = 'alert-card level-' + alert.alert_level;
+
+      var probStr = alert.collision_probability < 0.001
+        ? alert.collision_probability.toExponential(2)
+        : alert.collision_probability.toFixed(4);
+
+      var badgeClass = alert.alert_level === 2 ? 'level-2' : 'level-1';
+      var badgeText = alert.alert_level === 2 ? 'DANGER' : 'WARNING';
+
+      var tcaStr = alert.tca ? new Date(alert.tca).toLocaleString() : '--';
+
+      card.innerHTML =
+        '<div class="alert-pair">' +
+          alert.satellite_name_1 + ' \u2194 ' + alert.satellite_name_2 +
+          '<span class="alert-badge ' + badgeClass + '">' + badgeText + '</span>' +
+        '</div>' +
+        '<div class="alert-detail">' +
+          'TCA: <span>' + tcaStr + '</span><br>' +
+          '最小距离: <span>' + alert.miss_distance.toFixed(1) + ' km</span><br>' +
+          '碰撞概率: <span>' + probStr + '</span>' +
+        '</div>';
+
+      if (alert.alert_level === 2) {
+        var btn = document.createElement('button');
+        btn.className = 'btn-avoidance';
+        btn.textContent = alert.maneuver_planned ? '规避机动已规划' : '计算规避机动';
+        btn.disabled = alert.maneuver_planned;
+        btn.addEventListener('click', function() {
+          computeAvoidance(alert.alert_id, btn);
+        });
+        card.appendChild(btn);
+      }
+
+      list.appendChild(card);
+    });
+  }
+
+  function computeAvoidance(alertId, btn) {
+    btn.disabled = true;
+    btn.textContent = '计算中...';
+    fetch(API_BASE + '/api/compute-avoidance/' + alertId, { method: 'POST' })
+      .then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function(data) {
+        btn.textContent = '规避机动已规划';
+        showToast('规避机动计算完成', 'success');
+        loadAlerts();
+      })
+      .catch(function(err) {
+        btn.disabled = false;
+        btn.textContent = '计算规避机动';
+        showToast('规避机动计算失败: ' + err.message, 'error');
+      });
+  }
+
+  function loadOverview() {
+    fetch(API_BASE + '/api/constellation/overview')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        document.getElementById('stat-total').textContent = data.total_satellites;
+        document.getElementById('stat-alerts').textContent = data.active_alerts;
+        document.getElementById('stat-propellant').textContent = data.avg_propellant.toFixed(1) + '%';
+        document.getElementById('stat-coverage').textContent = data.coverage_status;
+      })
+      .catch(function(err) {
+        console.error('Failed to load overview:', err);
+      });
+  }
+
+  function onCanvasClick(event) {
+    var rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+
+    var clickableMeshes = [];
+    Object.keys(satelliteMeshes).forEach(function(id) {
+      var group = satelliteMeshes[id];
+      group.children.forEach(function(child) {
+        if (child.isMesh) {
+          child.userData.satelliteId = group.userData.satelliteId;
+          clickableMeshes.push(child);
+        }
+      });
+    });
+
+    var intersects = raycaster.intersectObjects(clickableMeshes, false);
+    if (intersects.length > 0) {
+      var hit = intersects[0].object;
+      var satId = hit.userData.satelliteId;
+      if (satId !== undefined) {
+        openDetailPanel(satId);
+      }
+    }
+  }
+
+  function openDetailPanel(satId) {
+    selectedSatelliteId = satId;
+    var sat = satelliteDataMap[satId];
+    if (!sat) return;
+
+    document.getElementById('detail-title').textContent = sat.name + ' (SAT-' + satId + ')';
+    var content = document.getElementById('detail-content');
+    content.innerHTML = '';
+
+    var risk = sat.collision_risk_level;
+    content.innerHTML +=
+      '<div class="detail-section">' +
+        '<h4>碰撞风险</h4>' +
+        '<span class="risk-badge ' + risk + '">' + risk.toUpperCase() + '</span>' +
+      '</div>';
+
+    var oe = sat.orbital_elements;
+    content.innerHTML +=
+      '<div class="detail-section">' +
+        '<h4>轨道根数</h4>' +
+        '<table class="detail-table">' +
+          '<tr><td>半长轴 (a)</td><td>' + oe.semi_major_axis.toFixed(2) + ' km</td></tr>' +
+          '<tr><td>离心率 (e)</td><td>' + oe.eccentricity.toFixed(6) + '</td></tr>' +
+          '<tr><td>轨道倾角 (i)</td><td>' + (oe.inclination * 180 / Math.PI).toFixed(4) + '\u00B0</td></tr>' +
+          '<tr><td>升交点赤经 (\u03A9)</td><td>' + (oe.raan * 180 / Math.PI).toFixed(4) + '\u00B0</td></tr>' +
+          '<tr><td>近地点幅角 (\u03C9)</td><td>' + (oe.arg_perigee * 180 / Math.PI).toFixed(4) + '\u00B0</td></tr>' +
+          '<tr><td>真近点角 (\u03BD)</td><td>' + (oe.true_anomaly * 180 / Math.PI).toFixed(4) + '\u00B0</td></tr>' +
+        '</table>' +
+      '</div>';
+
+    var pos = sat.current_position;
+    var vel = sat.velocity;
+    content.innerHTML +=
+      '<div class="detail-section">' +
+        '<h4>位置 / 速度 (ECI)</h4>' +
+        '<table class="detail-table">' +
+          '<tr><td>位置 X</td><td>' + pos.x.toFixed(2) + ' km</td></tr>' +
+          '<tr><td>位置 Y</td><td>' + pos.y.toFixed(2) + ' km</td></tr>' +
+          '<tr><td>位置 Z</td><td>' + pos.z.toFixed(2) + ' km</td></tr>' +
+          '<tr><td>速度 X</td><td>' + vel.x.toFixed(3) + ' km/s</td></tr>' +
+          '<tr><td>速度 Y</td><td>' + vel.y.toFixed(3) + ' km/s</td></tr>' +
+          '<tr><td>速度 Z</td><td>' + vel.z.toFixed(3) + ' km/s</td></tr>' +
+        '</table>' +
+      '</div>';
+
+    var prop = sat.propellant;
+    var propPct = Math.max(0, Math.min(100, prop.remaining));
+    var propColor = propPct > 50 ? '#4ecdc4' : propPct > 20 ? '#ffd700' : '#ff4444';
+    content.innerHTML +=
+      '<div class="detail-section">' +
+        '<h4>推进剂</h4>' +
+        '<table class="detail-table">' +
+          '<tr><td>剩余</td><td>' + prop.remaining.toFixed(1) + '%</td></tr>' +
+          '<tr><td>消耗速率</td><td>' + prop.consumption_rate.toFixed(4) + ' %/h</td></tr>' +
+          '<tr><td>预计寿命</td><td>' + prop.estimated_lifetime_hours.toFixed(0) + ' h</td></tr>' +
+        '</table>' +
+        '<div class="propellant-bar-bg"><div class="propellant-bar-fill" style="width:' + propPct + '%;background:' + propColor + '"></div></div>' +
+      '</div>';
+
+    var chartDiv = document.createElement('div');
+    chartDiv.className = 'detail-section';
+    chartDiv.innerHTML = '<h4>推进剂消耗趋势 (24h)</h4><canvas id="propellant-chart"></canvas>';
+    content.appendChild(chartDiv);
+    loadPropellantChart(satId);
+
+    var telemDiv = document.createElement('div');
+    telemDiv.className = 'detail-section';
+    telemDiv.innerHTML = '<h4>遥测历史 (1h)</h4><div id="telemetry-table-container">加载中...</div>';
+    content.appendChild(telemDiv);
+    loadTelemetryTable(satId);
+
+    document.getElementById('detail-panel').classList.add('open');
+  }
+
+  function closeDetailPanel() {
+    document.getElementById('detail-panel').classList.remove('open');
+    selectedSatelliteId = null;
+  }
+
+  function loadPropellantChart(satId) {
+    fetch(API_BASE + '/api/satellites/' + satId + '/propellant?hours=24')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        drawPropellantChart(data);
+      })
+      .catch(function() {
+        var canvas = document.getElementById('propellant-chart');
+        if (canvas) {
+          var ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#6888b8';
+          ctx.font = '12px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('数据加载失败', canvas.width / 2, canvas.height / 2);
+        }
+      });
+  }
+
+  function drawPropellantChart(data) {
+    var canvas = document.getElementById('propellant-chart');
+    if (!canvas) return;
+    var dpr = window.devicePixelRatio || 1;
+    var rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    var ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    var w = rect.width;
+    var h = rect.height;
+
+    ctx.fillStyle = 'rgba(5,5,30,0.6)';
+    ctx.fillRect(0, 0, w, h);
+
+    if (!data || data.length === 0) {
+      ctx.fillStyle = '#6888b8';
+      ctx.font = '11px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('暂无数据', w / 2, h / 2);
+      return;
+    }
+
+    var pad = { top: 10, right: 10, bottom: 20, left: 35 };
+    var plotW = w - pad.left - pad.right;
+    var plotH = h - pad.top - pad.bottom;
+
+    var propValues = data.map(function(d) { return d.propellant_remaining; });
+    var minVal = Math.min.apply(null, propValues);
+    var maxVal = Math.max.apply(null, propValues);
+    var range = maxVal - minVal;
+    if (range < 0.1) { minVal -= 1; maxVal += 1; range = maxVal - minVal; }
+
+    ctx.strokeStyle = 'rgba(100,140,255,0.1)';
+    ctx.lineWidth = 0.5;
+    for (var gi = 0; gi <= 4; gi++) {
+      var gy = pad.top + (gi / 4) * plotH;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, gy);
+      ctx.lineTo(pad.left + plotW, gy);
+      ctx.stroke();
+      ctx.fillStyle = '#6888b8';
+      ctx.font = '9px sans-serif';
+      ctx.textAlign = 'right';
+      var gVal = maxVal - (gi / 4) * range;
+      ctx.fillText(gVal.toFixed(1) + '%', pad.left - 4, gy + 3);
+    }
+
+    ctx.beginPath();
+    ctx.strokeStyle = '#4ecdc4';
+    ctx.lineWidth = 1.5;
+    data.forEach(function(d, i) {
+      var x = pad.left + (i / (data.length - 1)) * plotW;
+      var y = pad.top + (1 - (d.propellant_remaining - minVal) / range) * plotH;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    var grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + plotH);
+    grad.addColorStop(0, 'rgba(78,205,196,0.15)');
+    grad.addColorStop(1, 'rgba(78,205,196,0.0)');
+    ctx.lineTo(pad.left + plotW, pad.top + plotH);
+    ctx.lineTo(pad.left, pad.top + plotH);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    if (data.length > 0) {
+      var lastTime = new Date(data[data.length - 1].timestamp);
+      var firstTime = new Date(data[0].timestamp);
+      ctx.fillStyle = '#6888b8';
+      ctx.font = '9px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(firstTime.toLocaleTimeString(), pad.left, h - 4);
+      ctx.fillText(lastTime.toLocaleTimeString(), pad.left + plotW, h - 4);
+    }
+  }
+
+  function loadTelemetryTable(satId) {
+    fetch(API_BASE + '/api/satellites/' + satId + '/telemetry?hours=1')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        renderTelemetryTable(data);
+      })
+      .catch(function() {
+        var c = document.getElementById('telemetry-table-container');
+        if (c) c.innerHTML = '<div style="color:#6888b8;font-size:11px;padding:8px">数据加载失败</div>';
+      });
+  }
+
+  function renderTelemetryTable(data) {
+    var c = document.getElementById('telemetry-table-container');
+    if (!c) return;
+    if (!data || data.length === 0) {
+      c.innerHTML = '<div style="color:#6888b8;font-size:11px;padding:8px">暂无遥测数据</div>';
+      return;
+    }
+
+    var html = '<table class="telemetry-table">' +
+      '<thead><tr><th>时间</th><th>SMA (km)</th><th>离心率</th><th>推进剂</th></tr></thead><tbody>';
+
+    data.slice().reverse().forEach(function(d) {
+      var ts = d.timestamp ? new Date(d.timestamp).toLocaleTimeString() : '--';
+      var sma = d.semi_major_axis != null ? d.semi_major_axis.toFixed(2) : '--';
+      var ecc = d.eccentricity != null ? d.eccentricity.toFixed(6) : '--';
+      var prop = d.propellant_remaining != null ? d.propellant_remaining.toFixed(1) + '%' : '--';
+      html += '<tr><td>' + ts + '</td><td>' + sma + '</td><td>' + ecc + '</td><td>' + prop + '</td></tr>';
+    });
+
+    html += '</tbody></table>';
+    c.innerHTML = html;
+  }
+
+  function connectWebSocket() {
+    var statusEl = document.getElementById('ws-status');
+    try {
+      ws = new WebSocket(WS_URL);
+    } catch (e) {
+      statusEl.textContent = 'WS: 连接失败';
+      statusEl.className = 'ws-status disconnected';
+      scheduleReconnect();
+      return;
+    }
+
+    ws.onopen = function() {
+      statusEl.textContent = 'WS: 已连接';
+      statusEl.className = 'ws-status connected';
+    };
+
+    ws.onmessage = function(event) {
+      try {
+        var data = JSON.parse(event.data);
+        if (Array.isArray(data)) {
+          updateSatellitePositionsFromWS(data);
+        }
+      } catch (e) {
+        console.error('WS parse error:', e);
+      }
+    };
+
+    ws.onclose = function() {
+      statusEl.textContent = 'WS: 已断开';
+      statusEl.className = 'ws-status disconnected';
+      scheduleReconnect();
+    };
+
+    ws.onerror = function() {
+      statusEl.textContent = 'WS: 连接错误';
+      statusEl.className = 'ws-status disconnected';
+    };
+  }
+
+  function scheduleReconnect() {
+    if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = setTimeout(function() {
+      connectWebSocket();
+    }, 5000);
+  }
+
+  function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+    var delta = clock.getDelta();
+    var elapsed = clock.getElapsedTime();
+
+    controls.update();
+
+    if (earthGroup) {
+      earthGroup.rotation.y += delta * 0.02;
+    }
+
+    encounterMarkers.forEach(function(marker, idx) {
+      var pulse = 0.6 + 0.4 * Math.sin(elapsed * 3 + idx);
+      marker.material.opacity = pulse;
+      marker.scale.setScalar(0.8 + 0.4 * Math.sin(elapsed * 3 + idx));
+    });
+
+    Object.keys(satelliteMeshes).forEach(function(id) {
+      var mesh = satelliteMeshes[id];
+      var sat = satelliteDataMap[id];
+      if (sat && sat.collision_risk_level === 'danger') {
+        var blink = 0.7 + 0.3 * Math.sin(elapsed * 5);
+        mesh.children[0].material.emissiveIntensity = blink;
+      }
+    });
+
+    renderer.render(scene, camera);
+  }
+
+  function initUI() {
+    document.getElementById('detail-close').addEventListener('click', closeDetailPanel);
+
+    var toggleBtn = document.getElementById('alert-panel-toggle');
+    var alertPanel = document.getElementById('alert-panel');
+    var panelCollapsed = false;
+    toggleBtn.addEventListener('click', function() {
+      panelCollapsed = !panelCollapsed;
+      alertPanel.classList.toggle('collapsed', panelCollapsed);
+      toggleBtn.innerHTML = panelCollapsed ? '&#x25C0;' : '&#x25B6;';
+    });
+  }
+
+  function loadAllData() {
+    loadOverview();
+
+    fetch(API_BASE + '/api/satellites')
+      .then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function(satellites) {
+        updateSatellites(satellites);
+        loadOrbitPaths(satellites);
+
+        return fetch(API_BASE + '/api/collision-encounters')
+          .then(function(r) { return r.json(); })
+          .then(function(encounters) {
+            loadEncounterPoints(encounters);
+          })
+          .catch(function() {});
+      })
+      .then(function() {
+        var overlay = document.getElementById('loading-overlay');
+        overlay.classList.add('hidden');
+        setTimeout(function() { overlay.style.display = 'none'; }, 600);
+      })
+      .catch(function(err) {
+        console.error('Failed to load satellite data:', err);
+        var overlay = document.getElementById('loading-overlay');
+        overlay.querySelector('p').textContent = '数据加载失败，请检查后端服务';
+        overlay.querySelector('.spinner').style.borderTopColor = '#ff4444';
+      });
+
+    loadAlerts();
+  }
+
+  function startAutoRefresh() {
+    setInterval(function() {
+      loadOverview();
+      loadAlerts();
+
+      fetch(API_BASE + '/api/collision-encounters')
+        .then(function(r) { return r.json(); })
+        .then(function(encounters) {
+          loadEncounterPoints(encounters);
+        })
+        .catch(function() {});
+    }, 30000);
+  }
+
+  function init() {
+    initScene();
+    initUI();
+    loadAllData();
+    connectWebSocket();
+    startAutoRefresh();
+    animate();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>
