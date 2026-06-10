@@ -1,10 +1,12 @@
 use satellite_constellation_system::{
+    alarm_commander::AlarmCommander,
     api::{AppState, SharedState, create_router},
     clickhouse_client::ClickHouseClient,
+    collision_predictor::{CollisionAnalysis, CollisionPredictor},
+    config::AppConfig,
+    constellation_receiver::ConstellationReceiver,
     models::*,
-    orbit_optimizer::{AlertManager, AtmosphericDragModel, GeneticOrbitOptimizer},
-    sgp4_engine::{CollisionProbabilityCalculator, NumericalPropagator, NumericalPropagatorConfig, Sgp4Propagator},
-    udp_receiver::start_udp_receiver,
+    orbit_optimizer_service::{AlertManager, OrbitOptimizerService, OptimizerRequest},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,160 +23,106 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Satellite Constellation Orbit Control & Collision Warning System");
 
-    let ch_url = std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
-    let ch_db = "satellite_constellation";
+    let config = AppConfig::load()?;
+    tracing::info!("Configuration loaded from config.toml");
 
-    let clickhouse = ClickHouseClient::new(&ch_url, ch_db);
-    tracing::info!("ClickHouse client initialized: {}/{}", ch_url, ch_db);
+    let clickhouse = ClickHouseClient::new(
+        &config.network.clickhouse_url,
+        &config.network.clickhouse_database,
+    );
+    tracing::info!(
+        "ClickHouse client initialized: {}/{}",
+        config.network.clickhouse_url,
+        config.network.clickhouse_database
+    );
 
-    let state: SharedState = Arc::new(RwLock::new(AppState {
-        clickhouse,
-        propagator: Sgp4Propagator::new(),
-        numerical_propagator: NumericalPropagator::new(NumericalPropagatorConfig::default()),
-        calculator: CollisionProbabilityCalculator::new(),
-        optimizer: GeneticOrbitOptimizer::new(50, 30, 0.15),
-        alert_manager: AlertManager::new(),
-        drag_model: AtmosphericDragModel::new(),
-        latest_telemetry: HashMap::new(),
-        tle_cache: HashMap::new(),
-        active_analyses: Vec::new(),
-        active_alerts: HashMap::new(),
-    }));
+    let latest_telemetry: Arc<RwLock<HashMap<u16, TelemetryData>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let tle_cache: Arc<RwLock<HashMap<u16, TleData>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
-    let (tx, mut rx) = mpsc::channel::<TelemetryData>(10000);
+    let (raw_telemetry_tx, raw_telemetry_rx) = mpsc::channel::<TelemetryData>(10000);
+    let (raw_tle_tx, raw_tle_rx) = mpsc::channel::<TleData>(1000);
+    let (cp_telemetry_tx, cp_telemetry_rx) = mpsc::channel::<TelemetryData>(10000);
+    let (cp_tle_tx, cp_tle_rx) = mpsc::channel::<TleData>(1000);
+    let (analysis_tx, analysis_rx) = mpsc::channel::<CollisionAnalysis>(5000);
+    let (optimizer_request_tx, optimizer_request_rx) = mpsc::channel::<OptimizerRequest>(100);
 
-    let udp_state = state.clone();
+    let receiver = ConstellationReceiver::new(
+        config.network.telemetry_udp_port,
+        config.network.tle_udp_port,
+        config.reorder_buffer.clone(),
+    );
     let udp_task = tokio::spawn(async move {
-        match start_udp_receiver(tx).await {
-            Ok(_) => tracing::info!("UDP receiver stopped"),
-            Err(e) => tracing::error!("UDP receiver error: {}", e),
+        if let Err(e) = receiver.run(raw_telemetry_tx, raw_tle_tx).await {
+            tracing::error!("Constellation receiver error: {}", e);
         }
     });
 
-    let telemetry_state = state.clone();
+    let fanout_tel_state = latest_telemetry.clone();
+    let fanout_tel_ch = clickhouse.clone();
+    let fanout_tel_cp = cp_telemetry_tx;
     let telemetry_task = tokio::spawn(async move {
-        while let Some(data) = rx.recv().await {
-            let mut s = telemetry_state.write().await;
-
-            s.latest_telemetry.insert(data.satellite_id, data.clone());
-
-            if let Err(e) = s.clickhouse.insert_telemetry(&data).await {
-                tracing::warn!("Failed to insert telemetry for sat {}: {}", data.satellite_id, e);
+        while let Some(data) = raw_telemetry_rx.recv().await {
+            {
+                let mut map = fanout_tel_state.write().await;
+                map.insert(data.satellite_id, data.clone());
             }
+            if let Err(e) = fanout_tel_ch.insert_telemetry(&data).await {
+                tracing::debug!("Failed to insert telemetry for sat {}: {}", data.satellite_id, e);
+            }
+            let _ = fanout_tel_cp.send(data).await;
         }
     });
 
-    let collision_state = state.clone();
+    let fanout_tle_state = tle_cache.clone();
+    let fanout_tle_cp = cp_tle_tx;
+    let tle_task = tokio::spawn(async move {
+        while let Some(tle) = raw_tle_rx.recv().await {
+            {
+                let mut map = fanout_tle_state.write().await;
+                map.insert(tle.satellite_id, tle.clone());
+            }
+            let _ = fanout_tle_cp.send(tle).await;
+        }
+    });
+
+    let collision_predictor = CollisionPredictor::new(&config);
     let collision_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        loop {
-            interval.tick().await;
-            let mut s = collision_state.write().await;
-
-            if s.tle_cache.is_empty() {
-                tracing::debug!("TLE cache empty, skipping collision analysis");
-                continue;
-            }
-
-            let tle_ids: Vec<u16> = s.tle_cache.keys().copied().collect();
-            let tle_count = tle_ids.len();
-            tracing::info!("Running collision analysis for {} TLE entries", tle_count);
-
-            let mut analyses = Vec::new();
-
-            for i in 0..tle_ids.len() {
-                for j in (i + 1)..tle_ids.len() {
-                    let id1 = tle_ids[i];
-                    let id2 = tle_ids[j];
-
-                    if let (Some(tle1), Some(tle2)) = (s.tle_cache.get(&id1), s.tle_cache.get(&id2)) {
-                        let analysis = s.calculator.analyze_pair_dual(
-                            &s.propagator,
-                            &s.numerical_propagator,
-                            tle1,
-                            tle2,
-                            72.0,
-                        );
-
-                        if analysis.alert_level > 0 {
-                            tracing::warn!(
-                                "Collision risk: SAT-{:03} vs SAT-{:03}, prob={:.2e}, level={}, miss={:.3}km",
-                                id1, id2, analysis.collision_probability, analysis.alert_level,
-                                analysis.tca_result.miss_distance
-                            );
-
-                            if let Some(alert) = s.alert_manager.evaluate_collision(&analysis) {
-                                if s.active_alerts.insert(alert.alert_id, alert.clone()).is_none() {
-                                    let alert_clone = alert.clone();
-                                    let alert_state = collision_state.clone();
-                                    tokio::spawn(async move {
-                                        let s = alert_state.read().await;
-                                        if let Err(e) = s.alert_manager.push_alert_to_ground_station(&alert_clone).await {
-                                            tracing::warn!("Failed to push alert to ground station: {}", e);
-                                        }
-                                    });
-                                }
-                            }
-
-                            if analysis.alert_level == 2 {
-                                if let (Some(t1), Some(t2)) =
-                                    (s.latest_telemetry.get(&id1), s.latest_telemetry.get(&id2))
-                                {
-                                    if let (Some(tle1_ref), Some(tle2_ref)) =
-                                        (s.tle_cache.get(&id1), s.tle_cache.get(&id2))
-                                    {
-                                        let (_alert, maneuver) = s.alert_manager.compute_emergency_avoidance(
-                                            &analysis,
-                                            &s.optimizer,
-                                            t1,
-                                            t2,
-                                            tle1_ref,
-                                            tle2_ref,
-                                            &s.propagator,
-                                        );
-
-                                        if let Err(e) = s.clickhouse.insert_orbit_maneuver(&maneuver).await {
-                                            tracing::warn!("Failed to insert avoidance maneuver: {}", e);
-                                        }
-
-                                        let maneuver_clone = maneuver.clone();
-                                        let alert_state = collision_state.clone();
-                                        tokio::spawn(async move {
-                                            let s = alert_state.read().await;
-                                            if let Err(e) = s.alert_manager.push_maneuver_to_ground_station(&maneuver_clone).await {
-                                                tracing::warn!("Failed to push maneuver to ground station: {}", e);
-                                            }
-                                        });
-                                    }
-                                }
-                            }
-                        }
-
-                        analyses.push(analysis);
-                    }
-                }
-            }
-
-            s.active_analyses = analyses;
-            tracing::info!("Collision analysis complete");
-        }
+        collision_predictor.run(cp_telemetry_rx, cp_tle_rx, analysis_tx).await;
     });
 
-    let propellant_state = state.clone();
+    let optimizer_service = OrbitOptimizerService::new(&config);
+    let optimizer_task = tokio::spawn(async move {
+        optimizer_service.run(optimizer_request_rx).await;
+    });
+
+    let alert_manager = AlertManager::new(config.ground_station.clone());
+    let alarm_commander = AlarmCommander::new(
+        alert_manager,
+        clickhouse.clone(),
+        optimizer_request_tx.clone(),
+        latest_telemetry.clone(),
+        tle_cache.clone(),
+    );
+    let alarm_task = tokio::spawn(async move {
+        alarm_commander.run(analysis_rx).await;
+    });
+
+    let propellant_state = latest_telemetry.clone();
+    let propellant_ch = clickhouse.clone();
     let propellant_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            let s = propellant_state.read().await;
-
-            for (id, telemetry) in &s.latest_telemetry {
+            let tel_map = propellant_state.read().await;
+            for (id, telemetry) in tel_map.iter() {
                 let consumption_rate = 0.003 / 30.0 * 3600.0;
                 let est_lifetime = if consumption_rate > 0.0 {
                     telemetry.propellant_remaining / consumption_rate
                 } else {
                     999999.0
                 };
-
                 let history = PropellantHistory {
                     satellite_id: *id,
                     timestamp: chrono::Utc::now(),
@@ -182,51 +130,33 @@ async fn main() -> anyhow::Result<()> {
                     consumption_rate,
                     estimated_lifetime_hours: est_lifetime,
                 };
-
-                if let Err(e) = s.clickhouse.insert_propellant_history(&history).await {
+                if let Err(e) = propellant_ch.insert_propellant_history(&history).await {
                     tracing::debug!("Failed to insert propellant history for sat {}: {}", id, e);
                 }
             }
         }
     });
 
-    let tle_update_state = state.clone();
-    let tle_task = tokio::spawn(async move {
-        let udp_socket = tokio::net::UdpSocket::bind("0.0.0.0:9091").await?;
-        tracing::info!("TLE receiver listening on 0.0.0.0:9091");
-        let mut buf = [0u8; 8192];
-        loop {
-            match udp_socket.recv_from(&mut buf).await {
-                Ok((len, _addr)) => {
-                    let json_str = String::from_utf8_lossy(&buf[..len]);
-                    match serde_json::from_str::<TleData>(&json_str) {
-                        Ok(tle) => {
-                            let mut s = tle_update_state.write().await;
-                            s.tle_cache.insert(tle.satellite_id, tle);
-                        }
-                        Err(e) => {
-                            tracing::debug!("TLE parse error: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("TLE receive error: {}", e);
-                }
-            }
-        }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    });
+    let state: SharedState = Arc::new(RwLock::new(AppState {
+        clickhouse,
+        latest_telemetry,
+        tle_cache,
+        optimizer_request_tx,
+        config: config.clone(),
+    }));
 
     let app = create_router(state.clone())
         .layer(tower_http::cors::CorsLayer::permissive())
         .fallback(static_files_fallback);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    tracing::info!("HTTP server listening on 0.0.0.0:8080");
+    let listener = tokio::net::TcpListener::bind(format!(
+        "0.0.0.0:{}",
+        config.network.http_port
+    ))
+    .await?;
+    tracing::info!("HTTP server listening on 0.0.0.0:{}", config.network.http_port);
 
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal());
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
     if let Err(e) = server.await {
         tracing::error!("Server error: {}", e);
@@ -234,15 +164,17 @@ async fn main() -> anyhow::Result<()> {
 
     udp_task.abort();
     telemetry_task.abort();
-    collision_task.abort();
-    propellant_task.abort();
     tle_task.abort();
+    collision_task.abort();
+    optimizer_task.abort();
+    alarm_task.abort();
+    propellant_task.abort();
 
     tracing::info!("System shutdown complete");
     Ok(())
 }
 
-async fn static_files_fallback() -> impl IntoResponse {
+async fn static_files_fallback() -> impl axum::response::IntoResponse {
     (
         axum::http::StatusCode::OK,
         axum::http::HeaderMap::new(),

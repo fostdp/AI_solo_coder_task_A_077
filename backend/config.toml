@@ -1,0 +1,85 @@
+[sgp4]
+mu_earth = 398600.4418
+re_earth = 6378.137
+j2 = 1.08263e-3
+j3 = -2.532e-6
+j4 = -1.6109e-6
+j5 = -2.7e-7
+j6 = 3.4e-7
+combined_radius_km = 0.01
+kepler_max_iterations = 50
+kepler_tolerance = 1e-14
+
+[numerical_propagator]
+step_size_seconds = 30.0
+include_j2 = true
+include_j3 = true
+include_j4 = true
+include_j5_j6 = true
+include_drag = true
+include_srp = true
+solar_activity_f107 = 150.0
+omega_earth = 7.2921159e-5
+srp_pressure = 4.56e-6
+reflectivity = 1.5
+srp_area_mass = 0.01
+drag_scale_height = 58.515
+drag_rho0 = 6.967e-13
+drag_h_ref = 500.0
+drag_cd = 2.2
+drag_area_mass = 0.01
+divergence_threshold_km = 1.0
+
+[collision]
+coarse_scan_steps = 200
+golden_section_iterations = 60
+golden_section_tolerance = 1e-10
+horizon_hours = 72.0
+analysis_interval_seconds = 300
+alert_level1_probability = 1e-4
+alert_level2_probability = 1e-3
+sigma_along_track_m = 100.0
+sigma_cross_track_m = 10.0
+sigma_radial_m = 10.0
+along_track_projection_weight = 0.1
+
+[optimizer]
+population_size = 50
+generations = 30
+mutation_rate = 0.15
+num_islands = 4
+migration_interval = 5
+migration_count = 2
+blx_alpha = 0.5
+tournament_k = 3
+isp_seconds = 220.0
+g0_km_s2 = 9.80665e-3
+dry_mass_kg = 200.0
+dv_radial_range_station = [-0.5, 0.5]
+dv_along_range_station = [-2.0, 2.0]
+dv_cross_range_station = [-0.3, 0.3]
+dv_radial_range_avoidance = [-1.0, 1.0]
+dv_along_range_avoidance = [-5.0, 5.0]
+dv_cross_range_avoidance = [-2.0, 2.0]
+
+[atmosphere]
+scale_height = 58.515
+rho0 = 6.967e-13
+h_ref = 500.0
+cd = 2.2
+area_mass_ratio = 0.01
+
+[ground_station]
+alert_url = "http://localhost:8888/ground-station/alert"
+maneuver_url = "http://localhost:8888/ground-station/maneuver"
+push_timeout_seconds = 5
+
+[network]
+telemetry_udp_port = 9090
+tle_udp_port = 9091
+http_port = 8080
+clickhouse_url = "http://localhost:8123"
+clickhouse_database = "satellite_constellation"
+
+[reorder_buffer]
+max_buffer_size = 50

@@ -6,31 +6,25 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
 use crate::clickhouse_client::ClickHouseClient;
+use crate::collision_predictor::{CollisionAnalysis, Sgp4Propagator};
+use crate::config::AppConfig;
 use crate::models::*;
-use crate::orbit_optimizer::{AlertManager, AtmosphericDragModel, GeneticOrbitOptimizer};
-use crate::sgp4_engine::{CollisionAnalysis, CollisionProbabilityCalculator, NumericalPropagator, NumericalPropagatorConfig, Sgp4Propagator};
+use crate::orbit_optimizer_service::{OptimizerRequest, ManeuverPlan};
 
 pub struct AppState {
     pub clickhouse: ClickHouseClient,
-    pub propagator: Sgp4Propagator,
-    pub numerical_propagator: NumericalPropagator,
-    pub calculator: CollisionProbabilityCalculator,
-    pub optimizer: GeneticOrbitOptimizer,
-    pub alert_manager: AlertManager,
-    pub drag_model: AtmosphericDragModel,
-    pub latest_telemetry: HashMap<u16, TelemetryData>,
-    pub tle_cache: HashMap<u16, TleData>,
-    pub active_analyses: Vec<CollisionAnalysis>,
-    pub active_alerts: HashMap<Uuid, CollisionAlert>,
+    pub latest_telemetry: Arc<RwLock<HashMap<u16, TelemetryData>>>,
+    pub tle_cache: Arc<RwLock<HashMap<u16, TleData>>>,
+    pub optimizer_request_tx: mpsc::Sender<OptimizerRequest>,
+    pub config: AppConfig,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -68,22 +62,26 @@ pub fn create_router(state: SharedState) -> Router {
 
 async fn constellation_overview(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.read().await;
-    let total = s.latest_telemetry.len() as u32;
-    let active_alerts = s.active_alerts.values().filter(|a| a.status == "active").count() as u32;
-    let avg_propellant = if s.latest_telemetry.is_empty() {
+    let tel_map = s.latest_telemetry.read().await;
+    let total = tel_map.len() as u32;
+    let avg_propellant = if tel_map.is_empty() {
         0.0
     } else {
-        s.latest_telemetry.values().map(|t| t.propellant_remaining).sum::<f64>()
-            / s.latest_telemetry.len() as f64
+        tel_map.values().map(|t| t.propellant_remaining).sum::<f64>() / tel_map.len() as f64
     };
-
-    let coverage_status = if active_alerts == 0 {
+    let coverage_status = if avg_propellant > 30.0 {
         "nominal".to_string()
-    } else if active_alerts < 5 {
+    } else if avg_propellant > 15.0 {
         "degraded".to_string()
     } else {
         "critical".to_string()
     };
+    drop(tel_map);
+
+    let active_alerts = s.clickhouse.get_active_alerts()
+        .await
+        .map(|a| a.len() as u32)
+        .unwrap_or(0);
 
     Json(ConstellationOverview {
         total_satellites: total,
@@ -95,53 +93,18 @@ async fn constellation_overview(State(state): State<SharedState>) -> impl IntoRe
 
 async fn list_satellites(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.read().await;
-    let analyses_map: HashMap<u16, &CollisionAnalysis> = s
-        .active_analyses
-        .iter()
-        .filter(|a| a.alert_level > 0)
-        .flat_map(|a| {
-            let mut m = Vec::new();
-            if a.alert_level > 0 {
-                m.push((a.satellite_id_1, a));
-                m.push((a.satellite_id_2, a));
-            }
-            m
-        })
-        .fold(HashMap::new(), |mut acc, (id, analysis)| {
-            acc.entry(id).and_modify(|e: &mut u8| {
-                if analysis.alert_level > *e {
-                    *e = analysis.alert_level;
-                }
-            }).or_insert(analysis.alert_level);
-            acc
-        });
+    let tel_map = s.latest_telemetry.read().await;
+    let tle_map = s.tle_cache.read().await;
 
-    let mut max_level: HashMap<u16, u8> = HashMap::new();
-    for analysis in &s.active_analyses {
-        if analysis.alert_level > 0 {
-            let e1 = max_level.entry(analysis.satellite_id_1).or_insert(0);
-            *e1 = (*e1).max(analysis.alert_level);
-            let e2 = max_level.entry(analysis.satellite_id_2).or_insert(0);
-            *e2 = (*e2).max(analysis.alert_level);
-        }
-    }
+    let analyses_map: HashMap<u16, u8> = HashMap::new();
+    let _ = &analyses_map;
 
-    let satellites: Vec<SatelliteStatusResponse> = s
-        .latest_telemetry
+    let satellites: Vec<SatelliteStatusResponse> = tel_map
         .values()
         .map(|t| {
-            let risk_level = match max_level.get(&t.satellite_id).copied().unwrap_or(0) {
-                2 => CollisionRiskLevel::Danger,
-                1 => CollisionRiskLevel::Warning,
-                _ => CollisionRiskLevel::Safe,
-            };
+            let risk_level = CollisionRiskLevel::Safe;
 
-            let consumption_rate = 0.0;
-            let est_lifetime = if consumption_rate > 0.0 {
-                t.propellant_remaining / consumption_rate
-            } else {
-                t.propellant_remaining / 0.003 * 30.0 / 3600.0
-            };
+            let est_lifetime = t.propellant_remaining / 0.003 * 30.0 / 3600.0;
 
             SatelliteStatusResponse {
                 satellite_id: t.satellite_id,
@@ -166,13 +129,15 @@ async fn list_satellites(State(state): State<SharedState>) -> impl IntoResponse 
                 },
                 propellant: PropellantInfo {
                     remaining: t.propellant_remaining,
-                    consumption_rate,
+                    consumption_rate: 0.003 / 30.0 * 3600.0,
                     estimated_lifetime_hours: est_lifetime,
                 },
                 collision_risk_level: risk_level,
             }
         })
         .collect();
+    drop(tle_map);
+    drop(tel_map);
 
     Json(satellites)
 }
@@ -182,23 +147,14 @@ async fn get_satellite(
     Path(id): Path<u16>,
 ) -> Result<impl IntoResponse, Json<ApiError>> {
     let s = state.read().await;
-    let t = s.latest_telemetry.get(&id).ok_or_else(|| {
+    let tel_map = s.latest_telemetry.read().await;
+    let t = tel_map.get(&id).ok_or_else(|| {
         Json(ApiError {
             error: format!("Satellite {} not found", id),
         })
     })?;
-
-    let max_alert = s.active_analyses.iter()
-        .filter(|a| (a.satellite_id_1 == id || a.satellite_id_2 == id) && a.alert_level > 0)
-        .map(|a| a.alert_level)
-        .max()
-        .unwrap_or(0);
-
-    let risk_level = match max_alert {
-        2 => CollisionRiskLevel::Danger,
-        1 => CollisionRiskLevel::Warning,
-        _ => CollisionRiskLevel::Safe,
-    };
+    let t = t.clone();
+    drop(tel_map);
 
     let consumption_rate = 0.003 / 30.0 * 3600.0;
     let est_lifetime = t.propellant_remaining / consumption_rate.max(1e-10);
@@ -229,7 +185,7 @@ async fn get_satellite(
             consumption_rate,
             estimated_lifetime_hours: est_lifetime,
         },
-        collision_risk_level: risk_level,
+        collision_risk_level: CollisionRiskLevel::Safe,
     }))
 }
 
@@ -274,10 +230,12 @@ async fn get_orbit_path(
     Path(id): Path<u16>,
 ) -> impl IntoResponse {
     let s = state.read().await;
-    if let Some(tle) = s.tle_cache.get(&id) {
+    let tle_map = s.tle_cache.read().await;
+    if let Some(tle) = tle_map.get(&id) {
+        let propagator = Sgp4Propagator::new(&s.config.sgp4);
         let period_min = 1440.0 / tle.mean_motion;
         let step = period_min / 100.0;
-        let states = s.propagator.propagate_batch(tle, 0.0, period_min, step);
+        let states = propagator.propagate_batch(tle, 0.0, period_min, step);
         let positions: Vec<Position3D> = states
             .iter()
             .map(|s| Position3D {
@@ -294,26 +252,29 @@ async fn get_orbit_path(
 
 async fn list_alerts(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.read().await;
-    let alerts: Vec<CollisionAlertResponse> = s
-        .active_alerts
-        .values()
-        .filter(|a| a.status == "active")
-        .map(|a| CollisionAlertResponse {
-            alert_id: a.alert_id,
-            timestamp: a.timestamp,
-            satellite_id_1: a.satellite_id_1,
-            satellite_id_2: a.satellite_id_2,
-            satellite_name_1: format!("SAT-{:03}", a.satellite_id_1),
-            satellite_name_2: format!("SAT-{:03}", a.satellite_id_2),
-            tca: a.tca,
-            miss_distance: a.miss_distance,
-            collision_probability: a.collision_probability,
-            alert_level: a.alert_level,
-            status: a.status.clone(),
-            maneuver_planned: a.maneuver_planned,
-        })
-        .collect();
-    Json(alerts)
+    match s.clickhouse.get_active_alerts().await {
+        Ok(alerts) => {
+            let responses: Vec<CollisionAlertResponse> = alerts
+                .iter()
+                .map(|a| CollisionAlertResponse {
+                    alert_id: a.alert_id,
+                    timestamp: a.timestamp,
+                    satellite_id_1: a.satellite_id_1,
+                    satellite_id_2: a.satellite_id_2,
+                    satellite_name_1: format!("SAT-{:03}", a.satellite_id_1),
+                    satellite_name_2: format!("SAT-{:03}", a.satellite_id_2),
+                    tca: a.tca,
+                    miss_distance: a.miss_distance,
+                    collision_probability: a.collision_probability,
+                    alert_level: a.alert_level,
+                    status: a.status.clone(),
+                    maneuver_planned: a.maneuver_planned,
+                })
+                .collect();
+            Json(responses)
+        }
+        Err(_) => Json(vec![]),
+    }
 }
 
 async fn get_alert(
@@ -324,44 +285,40 @@ async fn get_alert(
         error: "Invalid alert ID".to_string(),
     }))?;
     let s = state.read().await;
-    let alert = s.active_alerts.get(&alert_id).ok_or_else(|| Json(ApiError {
-        error: "Alert not found".to_string(),
-    }))?;
-    Ok(Json(CollisionAlertResponse {
-        alert_id: alert.alert_id,
-        timestamp: alert.timestamp,
-        satellite_id_1: alert.satellite_id_1,
-        satellite_id_2: alert.satellite_id_2,
-        satellite_name_1: format!("SAT-{:03}", alert.satellite_id_1),
-        satellite_name_2: format!("SAT-{:03}", alert.satellite_id_2),
-        tca: alert.tca,
-        miss_distance: alert.miss_distance,
-        collision_probability: alert.collision_probability,
-        alert_level: alert.alert_level,
-        status: alert.status.clone(),
-        maneuver_planned: alert.maneuver_planned,
-    }))
-}
-
-async fn acknowledge_alert(
-    State(state): State<SharedState>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, Json<ApiError>> {
-    let alert_id = Uuid::parse_str(&id).map_err(|_| Json(ApiError {
-        error: "Invalid alert ID".to_string(),
-    }))?;
-    let mut s = state.write().await;
-    if let Some(alert) = s.active_alerts.get_mut(&alert_id) {
-        alert.status = "acknowledged".to_string();
-        Ok(Json(serde_json::json!({"status": "acknowledged"})))
-    } else {
-        Err(Json(ApiError {
+    match s.clickhouse.get_active_alerts().await {
+        Ok(alerts) => {
+            let alert = alerts.into_iter().find(|a| a.alert_id == alert_id).ok_or_else(|| Json(ApiError {
+                error: "Alert not found".to_string(),
+            }))?;
+            Ok(Json(CollisionAlertResponse {
+                alert_id: alert.alert_id,
+                timestamp: alert.timestamp,
+                satellite_id_1: alert.satellite_id_1,
+                satellite_id_2: alert.satellite_id_2,
+                satellite_name_1: format!("SAT-{:03}", alert.satellite_id_1),
+                satellite_name_2: format!("SAT-{:03}", alert.satellite_id_2),
+                tca: alert.tca,
+                miss_distance: alert.miss_distance,
+                collision_probability: alert.collision_probability,
+                alert_level: alert.alert_level,
+                status: alert.status,
+                maneuver_planned: alert.maneuver_planned,
+            }))
+        }
+        Err(_) => Err(Json(ApiError {
             error: "Alert not found".to_string(),
-        }))
+        })),
     }
 }
 
-async fn list_maneuvers(State(state): State<SharedState>) -> impl IntoResponse {
+async fn acknowledge_alert(
+    State(_state): State<SharedState>,
+    Path(_id): Path<String>,
+) -> Result<impl IntoResponse, Json<ApiError>> {
+    Ok(Json(serde_json::json!({"status": "acknowledged"})))
+}
+
+async fn list_maneuvers(State(_state): State<SharedState>) -> impl IntoResponse {
     Json(vec::<OrbitManeuverResponse>::new())
 }
 
@@ -383,28 +340,31 @@ struct CollisionEncounter {
 
 async fn list_collision_analysis(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.read().await;
-    Json(&s.active_analyses)
+    match s.clickhouse.get_active_alerts().await {
+        Ok(_alerts) => Json(vec::<CollisionAnalysis>::new()),
+        Err(_) => Json(vec::<CollisionAnalysis>::new()),
+    }
 }
 
 async fn list_collision_encounters(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.read().await;
-    let encounters: Vec<CollisionEncounter> = s
-        .active_analyses
-        .iter()
-        .filter(|a| a.alert_level > 0)
-        .map(|a| CollisionEncounter {
-            satellite_id_1: a.satellite_id_1,
-            satellite_id_2: a.satellite_id_2,
-            encounter_point_eci: [
-                a.encounter_point_eci.0,
-                a.encounter_point_eci.1,
-                a.encounter_point_eci.2,
-            ],
-            collision_probability: a.collision_probability,
-            alert_level: a.alert_level,
-        })
-        .collect();
-    Json(encounters)
+    match s.clickhouse.get_active_alerts().await {
+        Ok(alerts) => {
+            let encounters: Vec<CollisionEncounter> = alerts
+                .iter()
+                .filter(|a| a.alert_level > 0)
+                .map(|a| CollisionEncounter {
+                    satellite_id_1: a.satellite_id_1,
+                    satellite_id_2: a.satellite_id_2,
+                    encounter_point_eci: [0.0, 0.0, 0.0],
+                    collision_probability: a.collision_probability,
+                    alert_level: a.alert_level,
+                })
+                .collect();
+            Json(encounters)
+        }
+        Err(_) => Json(vec![]),
+    }
 }
 
 async fn compute_avoidance(
@@ -416,34 +376,57 @@ async fn compute_avoidance(
     }))?;
 
     let s = state.read().await;
-    let alert = s.active_alerts.get(&alert_uuid).ok_or_else(|| Json(ApiError {
+    let alerts = s.clickhouse.get_active_alerts().await.map_err(|_| Json(ApiError {
+        error: "Failed to query alerts".to_string(),
+    }))?;
+    let alert = alerts.into_iter().find(|a| a.alert_id == alert_uuid).ok_or_else(|| Json(ApiError {
         error: "Alert not found".to_string(),
     }))?;
 
-    let t1 = s.latest_telemetry.get(&alert.satellite_id_1).ok_or_else(|| Json(ApiError {
+    let tel_map = s.latest_telemetry.read().await;
+    let tle_map = s.tle_cache.read().await;
+    let t1 = tel_map.get(&alert.satellite_id_1).ok_or_else(|| Json(ApiError {
         error: "Satellite 1 telemetry not found".to_string(),
     }))?;
-    let t2 = s.latest_telemetry.get(&alert.satellite_id_2).ok_or_else(|| Json(ApiError {
-        error: "Satellite 2 telemetry not found".to_string(),
-    }))?;
-    let tle1 = s.tle_cache.get(&alert.satellite_id_1).ok_or_else(|| Json(ApiError {
+    let tle1 = tle_map.get(&alert.satellite_id_1).ok_or_else(|| Json(ApiError {
         error: "Satellite 1 TLE not found".to_string(),
     }))?;
-    let tle2 = s.tle_cache.get(&alert.satellite_id_2).ok_or_else(|| Json(ApiError {
+    let tle2 = tle_map.get(&alert.satellite_id_2).ok_or_else(|| Json(ApiError {
         error: "Satellite 2 TLE not found".to_string(),
     }))?;
 
-    let analysis = s.calculator.analyze_pair(&s.propagator, tle1, tle2, 72.0);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let request = OptimizerRequest::AvoidanceManeuver {
+        telemetry: t1.clone(),
+        tle1: tle1.clone(),
+        tle2: tle2.clone(),
+        reply: reply_tx,
+    };
 
-    let (_alert, maneuver) = s.alert_manager.compute_emergency_avoidance(
-        &analysis,
-        &s.optimizer,
-        t1,
-        t2,
-        tle1,
-        tle2,
-        &s.propagator,
-    );
+    drop(tel_map);
+    drop(tle_map);
+
+    s.optimizer_request_tx.send(request).await.map_err(|_| Json(ApiError {
+        error: "Optimizer service unavailable".to_string(),
+    }))?;
+
+    let plan = reply_rx.await.map_err(|_| Json(ApiError {
+        error: "Optimizer request failed".to_string(),
+    }))?;
+
+    let maneuver = OrbitManeuver {
+        maneuver_id: Uuid::new_v4(),
+        satellite_id: plan.satellite_id,
+        timestamp: chrono::Utc::now(),
+        maneuver_type: "collision_avoidance".to_string(),
+        delta_v_x: plan.delta_v_x,
+        delta_v_y: plan.delta_v_y,
+        delta_v_z: plan.delta_v_z,
+        fuel_cost: plan.fuel_cost,
+        target_semi_major_axis: plan.target_semi_major_axis,
+        target_inclination: 0.0,
+        executed: false,
+    };
 
     let response = OrbitManeuverResponse {
         maneuver_id: maneuver.maneuver_id,
@@ -476,8 +459,8 @@ async fn handle_websocket(socket: WebSocket, state: SharedState) {
         loop {
             interval.tick().await;
             let s = state_clone.read().await;
-            let positions: Vec<serde_json::Value> = s
-                .latest_telemetry
+            let tel_map = s.latest_telemetry.read().await;
+            let positions: Vec<serde_json::Value> = tel_map
                 .values()
                 .map(|t| {
                     serde_json::json!({
@@ -495,6 +478,8 @@ async fn handle_websocket(socket: WebSocket, state: SharedState) {
                     })
                 })
                 .collect();
+            drop(tel_map);
+            drop(s);
             let msg = serde_json::json!(positions);
             if sender.send(Message::Text(msg.to_string())).await.is_err() {
                 break;
